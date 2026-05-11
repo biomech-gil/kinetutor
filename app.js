@@ -7,6 +7,7 @@ const state = {
   selectedTool: "select",
   currentDraft: null,
   interaction: null,
+  contextMenu: null,
   players: [],
   annotations: [],
   tracks: [],
@@ -25,6 +26,8 @@ const els = {
   projectJson: document.querySelector("#projectJson"),
   exportCsv: document.querySelector("#exportCsv"),
   exportProject: document.querySelector("#exportProject"),
+  contextMenu: document.querySelector("#contextMenu"),
+  calibrateAction: document.querySelector("#calibrateAction"),
 };
 
 const DEFAULT_FPS = 30;
@@ -174,6 +177,14 @@ function distancePixels(a, b, player) {
   return Math.hypot(db.x - da.x, db.y - da.y);
 }
 
+function distanceLabel(distancePx, player) {
+  const calibration = player.calibration;
+  if (calibration?.pixelsPerUnit && calibration?.unit && calibration.unit !== "px") {
+    return `${(distancePx / calibration.pixelsPerUnit).toFixed(2)} ${calibration.unit}`;
+  }
+  return `${Math.round(distancePx)} px`;
+}
+
 function canvasDistance(a, b, player) {
   const da = denormalize(a, player);
   const db = denormalize(b, player);
@@ -241,8 +252,14 @@ function createAnnotation(player, type, points) {
 
 function measurementMetrics(player, type, points) {
   if (type === "line" && points.length >= 2) {
+    const distancePx = Number(distancePixels(points[0], points[1], player).toFixed(3));
+    const metrics = { distancePx };
+    if (player.calibration?.pixelsPerUnit && player.calibration?.unit && player.calibration.unit !== "px") {
+      metrics.distanceReal = Number((distancePx / player.calibration.pixelsPerUnit).toFixed(4));
+      metrics.unit = player.calibration.unit;
+    }
     return {
-      distancePx: Number(distancePixels(points[0], points[1], player).toFixed(3)),
+      ...metrics,
     };
   }
 
@@ -259,6 +276,12 @@ function updateAnnotationMetrics(annotation, player = playerById(annotation.play
   if (!annotation || !player) return;
   annotation.metrics = measurementMetrics(player, annotation.type, annotation.points);
   annotation.sourceTime = Number(sourceTimeFor(player, annotation.analysisTime).toFixed(6));
+}
+
+function refreshPlayerMeasurements(player) {
+  state.annotations
+    .filter((annotation) => annotation.playerId === player.id)
+    .forEach((annotation) => updateAnnotationMetrics(annotation, player));
 }
 
 function createDefaultAnglePoints(center) {
@@ -321,6 +344,71 @@ function hitTestAnnotation(player, point) {
   return null;
 }
 
+function showContextMenu(event, player) {
+  event.preventDefault();
+  event.stopPropagation();
+  const point = normalizedPoint(event, player);
+  const hit = hitTestAnnotation(player, point);
+
+  if (!hit || hit.annotation.type !== "line") {
+    hideContextMenu();
+    return;
+  }
+
+  state.selectedAnnotationId = hit.annotation.id;
+  state.contextMenu = {
+    playerId: player.id,
+    annotationId: hit.annotation.id,
+  };
+  els.contextMenu.style.left = `${event.clientX}px`;
+  els.contextMenu.style.top = `${event.clientY}px`;
+  els.contextMenu.hidden = false;
+  drawAllOverlays();
+}
+
+function hideContextMenu() {
+  state.contextMenu = null;
+  els.contextMenu.hidden = true;
+}
+
+function calibrateSelectedLine() {
+  const context = state.contextMenu;
+  hideContextMenu();
+  if (!context) return;
+
+  const player = playerById(context.playerId);
+  const annotation = annotationById(context.annotationId);
+  if (!player || !annotation || annotation.type !== "line") return;
+
+  const distancePx = distancePixels(annotation.points[0], annotation.points[1], player);
+  const previous = player.calibration?.pixelsPerUnit
+    ? (distancePx / player.calibration.pixelsPerUnit).toFixed(2)
+    : "";
+  const value = window.prompt("이 막대의 실제 길이를 입력하세요. 예: 50 cm", previous ? `${previous} ${player.calibration.unit}` : "10 cm");
+  if (!value) return;
+
+  const match = value.trim().match(/^([0-9]*\.?[0-9]+)\s*([a-zA-Z가-힣]*)$/);
+  if (!match) {
+    window.alert("숫자와 단위를 입력하세요. 예: 50 cm");
+    return;
+  }
+
+  const realLength = Number(match[1]);
+  const unit = match[2] || "cm";
+  if (!Number.isFinite(realLength) || realLength <= 0 || distancePx <= EPSILON) return;
+
+  player.calibration = {
+    pixelsPerUnit: Number((distancePx / realLength).toFixed(6)),
+    unit,
+    referenceAnnotationId: annotation.id,
+    referenceDistancePx: Number(distancePx.toFixed(3)),
+    referenceLength: realLength,
+  };
+  refreshPlayerMeasurements(player);
+  updateExports();
+  drawAllOverlays();
+}
+
 function playerCard(player) {
   const sourceTime = sourceTimeFor(player);
   return `
@@ -370,6 +458,7 @@ function renderPlayers() {
     canvas.addEventListener("pointermove", (event) => handleCanvasPointerMove(event, player));
     canvas.addEventListener("pointerup", (event) => finishCanvasInteraction(event, player));
     canvas.addEventListener("pointercancel", (event) => finishCanvasInteraction(event, player));
+    canvas.addEventListener("contextmenu", (event) => showContextMenu(event, player));
 
     card.querySelectorAll("[data-field]").forEach((input) => {
       input.addEventListener("change", () => {
@@ -542,7 +631,7 @@ async function addFiles(files) {
               fps: DEFAULT_FPS,
               calibration: {
                 pixelsPerUnit: null,
-                unit: "px",
+                unit: "cm",
               },
             });
           };
@@ -698,7 +787,7 @@ function drawAnnotation(ctx, player, annotation, isDraft = false) {
 
   if (annotation.type === "line" && annotation.points.length >= 2) {
     drawLine(ctx, annotation.points[0], annotation.points[1], player, color);
-    drawLabel(ctx, `${Math.round(distancePixels(annotation.points[0], annotation.points[1], player))} px`, midpoint(annotation.points[0], annotation.points[1]), player);
+    drawLabel(ctx, distanceLabel(distancePixels(annotation.points[0], annotation.points[1], player), player), midpoint(annotation.points[0], annotation.points[1]), player);
   }
 
   if (annotation.type === "angle") {
@@ -787,6 +876,13 @@ document.addEventListener("click", (event) => {
   const card = button.closest(".player-card");
   if (card) setActivePlayer(card.dataset.playerId);
   setTool(button.dataset.tool);
+});
+els.calibrateAction.addEventListener("click", calibrateSelectedLine);
+document.addEventListener("pointerdown", (event) => {
+  if (!els.contextMenu.hidden && !event.target.closest("#contextMenu")) hideContextMenu();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") hideContextMenu();
 });
 els.exportCsv.addEventListener("click", () => downloadText("analysis_annotations.csv", csvRows(), "text/csv"));
 els.exportProject.addEventListener("click", () => downloadText("kinematic_project.json", JSON.stringify(projectSnapshot(), null, 2), "application/json"));
