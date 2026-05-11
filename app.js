@@ -8,6 +8,7 @@ const state = {
   currentDraft: null,
   interaction: null,
   contextMenu: null,
+  roiAssignment: null,
   players: [],
   annotations: [],
   tracks: [],
@@ -29,7 +30,9 @@ const els = {
   contextMenu: document.querySelector("#contextMenu"),
   calibrateAction: document.querySelector("#calibrateAction"),
   reverseAngleAction: document.querySelector("#reverseAngleAction"),
+  assignRoiAction: document.querySelector("#assignRoiAction"),
   trackMarkerAction: document.querySelector("#trackMarkerAction"),
+  deleteAction: document.querySelector("#deleteAction"),
 };
 
 const DEFAULT_FPS = 30;
@@ -112,6 +115,7 @@ function setTool(tool) {
   state.selectedTool = tool;
   state.currentDraft = null;
   state.interaction = null;
+  if (tool !== "trackbox") state.roiAssignment = null;
   updateToolUI();
   drawAllOverlays();
 }
@@ -271,7 +275,7 @@ function annotationsForFrame(playerId) {
   );
 }
 
-function createAnnotation(player, type, points) {
+function createAnnotation(player, type, points, extra = {}) {
   const annotation = {
     id: uid(),
     playerId: player.id,
@@ -282,6 +286,7 @@ function createAnnotation(player, type, points) {
     options: type === "angle" ? { invertAngleSign: false } : {},
     metrics: {},
     label: `${type}-${state.annotations.length + 1}`,
+    ...extra,
   };
   annotation.metrics = measurementMetrics(player, type, points, annotation.options);
   state.annotations.push(annotation);
@@ -349,6 +354,10 @@ function annotationById(annotationId) {
   return state.annotations.find((annotation) => annotation.id === annotationId);
 }
 
+function trackById(trackId) {
+  return state.tracks.find((track) => track.id === trackId);
+}
+
 function hitTestAnnotation(player, point) {
   const hitRadius = 14 * (window.devicePixelRatio || 1);
   const bodyRadius = 10 * (window.devicePixelRatio || 1);
@@ -389,6 +398,25 @@ function hitTestAnnotation(player, point) {
   return null;
 }
 
+function hitTestTrack(player, point) {
+  const hitRadius = 16 * (window.devicePixelRatio || 1);
+  const tracks = state.tracks.filter((track) => track.playerId === player.id).slice().reverse();
+
+  for (const track of tracks) {
+    const current = sampleAtTrackTime(track, state.analysisTime);
+    if (current && canvasDistance(point, current, player) <= hitRadius) return track;
+
+    const visibleSamples = track.samples.filter((sample) => sample.analysisTime <= state.analysisTime);
+    for (let index = 1; index < visibleSamples.length; index++) {
+      if (distanceToSegment(point, visibleSamples[index - 1], visibleSamples[index], player) <= hitRadius * 0.7) {
+        return track;
+      }
+    }
+  }
+
+  return null;
+}
+
 function showContextMenu(event, player) {
   event.preventDefault();
   event.stopPropagation();
@@ -396,6 +424,23 @@ function showContextMenu(event, player) {
   const hit = hitTestAnnotation(player, point);
 
   if (!hit || !["line", "angle", "marker", "trackbox"].includes(hit.annotation.type)) {
+    const track = hitTestTrack(player, point);
+    if (track) {
+      state.contextMenu = {
+        playerId: player.id,
+        trackId: track.id,
+        targetKind: "track",
+      };
+      els.contextMenu.style.left = `${event.clientX}px`;
+      els.contextMenu.style.top = `${event.clientY}px`;
+      els.calibrateAction.hidden = true;
+      els.reverseAngleAction.hidden = true;
+      els.assignRoiAction.hidden = true;
+      els.trackMarkerAction.hidden = true;
+      els.deleteAction.hidden = false;
+      els.contextMenu.hidden = false;
+      return;
+    }
     hideContextMenu();
     return;
   }
@@ -404,12 +449,15 @@ function showContextMenu(event, player) {
   state.contextMenu = {
     playerId: player.id,
     annotationId: hit.annotation.id,
+    targetKind: "annotation",
   };
   els.contextMenu.style.left = `${event.clientX}px`;
   els.contextMenu.style.top = `${event.clientY}px`;
   els.calibrateAction.hidden = hit.annotation.type !== "line";
   els.reverseAngleAction.hidden = hit.annotation.type !== "angle";
+  els.assignRoiAction.hidden = hit.annotation.type !== "marker";
   els.trackMarkerAction.hidden = !["marker", "trackbox"].includes(hit.annotation.type);
+  els.deleteAction.hidden = false;
   els.contextMenu.hidden = false;
   drawAllOverlays();
 }
@@ -473,6 +521,57 @@ function reverseSelectedAngleSign() {
   drawAllOverlays();
 }
 
+function beginMarkerRoiAssignment() {
+  const context = state.contextMenu;
+  hideContextMenu();
+  if (!context) return;
+  const marker = annotationById(context.annotationId);
+  const player = playerById(context.playerId);
+  if (!marker || !player || marker.type !== "marker") return;
+
+  state.roiAssignment = {
+    playerId: player.id,
+    markerId: marker.id,
+  };
+  state.selectedAnnotationId = marker.id;
+  setTool("trackbox");
+  els.timeReadout.textContent = "마커 주변 물체를 감싸는 박스를 드래그하세요";
+}
+
+function deleteSelectedContextObject() {
+  const context = state.contextMenu;
+  hideContextMenu();
+  if (!context) return;
+
+  if (context.targetKind === "track") {
+    state.tracks = state.tracks.filter((track) => track.id !== context.trackId);
+    updateExports();
+    drawAllOverlays();
+    return;
+  }
+
+  const annotation = annotationById(context.annotationId);
+  if (!annotation) return;
+  const linkedBoxIds = annotation.type === "marker"
+    ? state.annotations.filter((item) => item.type === "trackbox" && item.linkedMarkerId === annotation.id).map((item) => item.id)
+    : [];
+  state.annotations = state.annotations.filter((item) => item.id !== annotation.id);
+  if (state.selectedAnnotationId === annotation.id) state.selectedAnnotationId = null;
+  state.tracks = state.tracks.filter((track) => track.sourceAnnotationId !== annotation.id && !linkedBoxIds.includes(track.sourceAnnotationId));
+
+  if (annotation.type === "trackbox" && annotation.linkedMarkerId) {
+    const marker = annotationById(annotation.linkedMarkerId);
+    if (marker?.trackingRoi?.trackboxId === annotation.id) delete marker.trackingRoi;
+  }
+
+  if (annotation.type === "marker") {
+    state.annotations = state.annotations.filter((item) => !linkedBoxIds.includes(item.id));
+  }
+
+  updateExports();
+  drawAllOverlays();
+}
+
 function trackingTargetForPlayer(player) {
   const selected = annotationById(state.selectedAnnotationId);
   if (selected?.playerId === player.id && ["marker", "trackbox"].includes(selected.type)) return selected;
@@ -486,6 +585,23 @@ function trackingTargetForPlayer(player) {
 }
 
 function trackingSeed(target, player) {
+  if (target.type === "marker" && target.trackingRoi?.points?.length >= 2) {
+    const rect = rectFromPoints(target.trackingRoi.points[0], target.trackingRoi.points[1]);
+    const videoWidth = player.video?.videoWidth || 1280;
+    const videoHeight = player.video?.videoHeight || 720;
+    const halfSize = clamp(Math.round(Math.max(rect.width * videoWidth, rect.height * videoHeight) / 2), 8, 28);
+    return {
+      point: { ...target.points[0] },
+      halfSize,
+      roiNorm: {
+        width: Math.max(rect.width, halfSize * 2 / videoWidth),
+        height: Math.max(rect.height, halfSize * 2 / videoHeight),
+      },
+      roiRect: rect,
+      seedType: "marker-roi",
+    };
+  }
+
   if (target.type === "trackbox" && target.points.length >= 2) {
     const rect = rectFromPoints(target.points[0], target.points[1]);
     const videoWidth = player.video?.videoWidth || 1280;
@@ -498,6 +614,7 @@ function trackingSeed(target, player) {
         width: Math.max(rect.width, halfSize * 2 / videoWidth),
         height: Math.max(rect.height, halfSize * 2 / videoHeight),
       },
+      roiRect: rect,
       seedType: "trackbox",
     };
   }
@@ -506,6 +623,7 @@ function trackingSeed(target, player) {
     point: { ...target.points[0] },
     halfSize: 9,
     roiNorm: null,
+    roiRect: null,
     seedType: "marker",
   };
 }
@@ -600,6 +718,75 @@ function extractColorModel(imageData, point, innerRadius = 10, outerRadius = 28)
     innerRadius,
     outerRadius,
     expectedArea: Math.PI * innerRadius * innerRadius,
+  };
+}
+
+function extractColorModelFromRoi(imageData, centerPoint, roiNorm) {
+  if (!roiNorm) return extractColorModel(imageData, centerPoint);
+  const centerX = Math.round(centerPoint.x * imageData.width);
+  const centerY = Math.round(centerPoint.y * imageData.height);
+  const halfWidth = Math.max(5, Math.round((roiNorm.width * imageData.width) / 2));
+  const halfHeight = Math.max(5, Math.round((roiNorm.height * imageData.height) / 2));
+  const foreground = [];
+  const background = [];
+  const outerScale = 1.65;
+  const outerHalfWidth = Math.round(halfWidth * outerScale);
+  const outerHalfHeight = Math.round(halfHeight * outerScale);
+
+  for (let y = centerY - outerHalfHeight; y <= centerY + outerHalfHeight; y++) {
+    if (y < 0 || y >= imageData.height) continue;
+    for (let x = centerX - outerHalfWidth; x <= centerX + outerHalfWidth; x++) {
+      if (x < 0 || x >= imageData.width) continue;
+      const insideInner = Math.abs(x - centerX) <= halfWidth && Math.abs(y - centerY) <= halfHeight;
+      const insideOuter = Math.abs(x - centerX) <= outerHalfWidth && Math.abs(y - centerY) <= outerHalfHeight;
+      if (insideInner) foreground.push(rgbAt(imageData, x, y));
+      else if (insideOuter) background.push(rgbAt(imageData, x, y));
+    }
+  }
+
+  if (!foreground.length || !background.length) return extractColorModel(imageData, centerPoint);
+  const fgMean = averageRgb(foreground);
+  const bgMean = averageRgb(background);
+  return {
+    fgMean,
+    bgMean,
+    separation: rgbDistance(fgMean, bgMean),
+    innerRadius: Math.max(halfWidth, halfHeight),
+    outerRadius: Math.max(outerHalfWidth, outerHalfHeight),
+    expectedArea: foreground.length,
+  };
+}
+
+function extractColorModelFromRect(imageData, rect) {
+  const minX = Math.max(0, Math.round(rect.x * imageData.width));
+  const maxX = Math.min(imageData.width - 1, Math.round((rect.x + rect.width) * imageData.width));
+  const minY = Math.max(0, Math.round(rect.y * imageData.height));
+  const maxY = Math.min(imageData.height - 1, Math.round((rect.y + rect.height) * imageData.height));
+  if (maxX <= minX || maxY <= minY) return null;
+
+  const padX = Math.max(4, Math.round((maxX - minX) * 0.45));
+  const padY = Math.max(4, Math.round((maxY - minY) * 0.45));
+  const foreground = [];
+  const background = [];
+
+  for (let y = Math.max(0, minY - padY); y <= Math.min(imageData.height - 1, maxY + padY); y++) {
+    for (let x = Math.max(0, minX - padX); x <= Math.min(imageData.width - 1, maxX + padX); x++) {
+      const inside = x >= minX && x <= maxX && y >= minY && y <= maxY;
+      if (inside) foreground.push(rgbAt(imageData, x, y));
+      else background.push(rgbAt(imageData, x, y));
+    }
+  }
+
+  if (!foreground.length || !background.length) return null;
+  const fgMean = averageRgb(foreground);
+  const bgMean = averageRgb(background);
+  return {
+    fgMean,
+    bgMean,
+    separation: rgbDistance(fgMean, bgMean),
+    innerRadius: Math.max(maxX - minX, maxY - minY) / 2,
+    outerRadius: Math.max(maxX - minX + padX * 2, maxY - minY + padY * 2) / 2,
+    expectedArea: foreground.length,
   };
 }
 
@@ -971,7 +1158,9 @@ async function trackSelectedMarkerForward(player = activePlayer()) {
   await seekVideoTo(player, sourceTimeFor(player, startAnalysisTime));
   let imageData = captureVideoFrame(player);
   const initialTemplate = imageData ? extractTemplate(imageData, point, halfSize) : null;
-  const colorModel = imageData ? extractColorModel(imageData, point, Math.max(10, halfSize), 32) : null;
+  const colorModel = imageData
+    ? extractColorModelFromRect(imageData, seed.roiRect) ?? extractColorModelFromRoi(imageData, point, seed.roiNorm) ?? extractColorModel(imageData, point, Math.max(10, halfSize), 32)
+    : null;
   let adaptiveTemplate = initialTemplate;
   if (!initialTemplate || !colorModel) {
     window.alert("마커가 영상 가장자리와 너무 가깝습니다. 조금 안쪽에 마커를 놓고 다시 시도하세요.");
@@ -1192,6 +1381,25 @@ function handleCanvasPointerDown(event, player) {
   setActivePlayer(player.id);
   const point = normalizedPoint(event, player);
   player.canvas.setPointerCapture?.(event.pointerId);
+
+  if (state.roiAssignment?.playerId === player.id && state.selectedTool === "trackbox") {
+    const annotation = createAnnotation(player, "trackbox", [point, point], {
+      linkedMarkerId: state.roiAssignment.markerId,
+      label: "tracking-roi",
+    });
+    state.roiAssignment.trackboxId = annotation.id;
+    state.selectedAnnotationId = annotation.id;
+    state.interaction = {
+      type: "drag-point",
+      playerId: player.id,
+      annotationId: annotation.id,
+      pointIndex: 1,
+      pointerId: event.pointerId,
+    };
+    drawAllOverlays();
+    return;
+  }
+
   const hit = hitTestAnnotation(player, point);
 
   if (hit && (state.selectedTool === "select" || hit.annotation.type === state.selectedTool || hit.mode === "point")) {
@@ -1301,7 +1509,34 @@ function finishCanvasInteraction(event, player) {
   if (!state.interaction || state.interaction.playerId !== player.id) return;
   if (state.interaction.pointerId !== event.pointerId) return;
   const annotation = annotationById(state.interaction.annotationId);
-  if (annotation) updateAnnotationMetrics(annotation, player);
+  if (annotation) {
+    updateAnnotationMetrics(annotation, player);
+    if (annotation.type === "trackbox") {
+      const rect = rectFromPoints(annotation.points[0], annotation.points[1]);
+      if (rect.width < 0.01 || rect.height < 0.01) {
+        state.annotations = state.annotations.filter((item) => item.id !== annotation.id);
+        if (state.roiAssignment?.trackboxId === annotation.id) state.roiAssignment = null;
+        state.selectedAnnotationId = null;
+        state.interaction = null;
+        player.canvas.releasePointerCapture?.(event.pointerId);
+        updateExports();
+        drawAllOverlays();
+        return;
+      }
+    }
+    if (annotation.type === "trackbox" && state.roiAssignment?.trackboxId === annotation.id) {
+      const marker = annotationById(state.roiAssignment.markerId);
+      if (marker) {
+        marker.trackingRoi = {
+          trackboxId: annotation.id,
+          points: annotation.points,
+        };
+      }
+      state.roiAssignment = null;
+      state.selectedAnnotationId = marker?.id ?? annotation.id;
+      setTool("select");
+    }
+  }
   state.interaction = null;
   player.canvas.releasePointerCapture?.(event.pointerId);
   updateExports();
@@ -1572,7 +1807,7 @@ function drawAnnotation(ctx, player, annotation, isDraft = false) {
   }
 
   if (annotation.type === "marker" && annotation.points.length) {
-    drawLabel(ctx, annotation.label, annotation.points[0], player);
+    drawLabel(ctx, annotation.trackingRoi ? `${annotation.label} + ROI` : annotation.label, annotation.points[0], player);
   }
 }
 
@@ -1681,11 +1916,13 @@ document.addEventListener("click", (event) => {
 });
 els.calibrateAction.addEventListener("click", calibrateSelectedLine);
 els.reverseAngleAction.addEventListener("click", reverseSelectedAngleSign);
+els.assignRoiAction.addEventListener("click", beginMarkerRoiAssignment);
 els.trackMarkerAction.addEventListener("click", () => {
   const context = state.contextMenu;
   const player = context ? playerById(context.playerId) : activePlayer();
   trackSelectedMarkerForward(player);
 });
+els.deleteAction.addEventListener("click", deleteSelectedContextObject);
 document.addEventListener("pointerdown", (event) => {
   if (!els.contextMenu.hidden && !event.target.closest("#contextMenu")) hideContextMenu();
 });
