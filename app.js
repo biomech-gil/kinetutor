@@ -28,6 +28,8 @@ const els = {
   exportProject: document.querySelector("#exportProject"),
   contextMenu: document.querySelector("#contextMenu"),
   calibrateAction: document.querySelector("#calibrateAction"),
+  reverseAngleAction: document.querySelector("#reverseAngleAction"),
+  trackMarkerAction: document.querySelector("#trackMarkerAction"),
 };
 
 const DEFAULT_FPS = 30;
@@ -212,16 +214,33 @@ function midpoint(a, b) {
   };
 }
 
-function angleDegrees(a, b, c, player) {
+function angleDegrees(a, b, c, player, invertSign = false) {
   const pa = sourcePixelPoint(a, player);
   const pb = sourcePixelPoint(b, player);
   const pc = sourcePixelPoint(c, player);
   const ab = { x: pa.x - pb.x, y: pa.y - pb.y };
   const cb = { x: pc.x - pb.x, y: pc.y - pb.y };
   const dot = ab.x * cb.x + ab.y * cb.y;
-  const mag = Math.hypot(ab.x, ab.y) * Math.hypot(cb.x, cb.y);
-  if (mag < EPSILON) return 0;
-  return (Math.acos(clamp(dot / mag, -1, 1)) * 180) / Math.PI;
+  const cross = ab.x * cb.y - ab.y * cb.x;
+  if (Math.hypot(ab.x, ab.y) * Math.hypot(cb.x, cb.y) < EPSILON) return 0;
+  let signed = (-Math.atan2(cross, dot) * 180) / Math.PI;
+  if (invertSign) signed *= -1;
+  return Math.abs(signed) < 0.05 ? 0 : signed;
+}
+
+function angleForAnnotation(annotation, player) {
+  return angleDegrees(
+    annotation.points[0],
+    annotation.points[1],
+    annotation.points[2],
+    player,
+    annotation.options?.invertAngleSign,
+  );
+}
+
+function formatAngle(value) {
+  const safe = Math.abs(value) < 0.05 ? 0 : value;
+  return `${safe.toFixed(1)}°`;
 }
 
 function annotationsForFrame(playerId) {
@@ -241,16 +260,18 @@ function createAnnotation(player, type, points) {
     analysisTime: Number(state.analysisTime.toFixed(6)),
     sourceTime: Number(sourceTimeFor(player).toFixed(6)),
     points,
-    metrics: measurementMetrics(player, type, points),
+    options: type === "angle" ? { invertAngleSign: false } : {},
+    metrics: {},
     label: `${type}-${state.annotations.length + 1}`,
   };
+  annotation.metrics = measurementMetrics(player, type, points, annotation.options);
   state.annotations.push(annotation);
   updateExports();
   drawAllOverlays();
   return annotation;
 }
 
-function measurementMetrics(player, type, points) {
+function measurementMetrics(player, type, points, options = {}) {
   if (type === "line" && points.length >= 2) {
     const distancePx = Number(distancePixels(points[0], points[1], player).toFixed(3));
     const metrics = { distancePx };
@@ -265,7 +286,7 @@ function measurementMetrics(player, type, points) {
 
   if (type === "angle" && points.length >= 3) {
     return {
-      angleDeg: Number(angleDegrees(points[0], points[1], points[2], player).toFixed(3)),
+      angleDeg: Number(angleDegrees(points[0], points[1], points[2], player, options.invertAngleSign).toFixed(3)),
     };
   }
 
@@ -274,7 +295,7 @@ function measurementMetrics(player, type, points) {
 
 function updateAnnotationMetrics(annotation, player = playerById(annotation.playerId)) {
   if (!annotation || !player) return;
-  annotation.metrics = measurementMetrics(player, annotation.type, annotation.points);
+  annotation.metrics = measurementMetrics(player, annotation.type, annotation.points, annotation.options);
   annotation.sourceTime = Number(sourceTimeFor(player, annotation.analysisTime).toFixed(6));
 }
 
@@ -350,7 +371,7 @@ function showContextMenu(event, player) {
   const point = normalizedPoint(event, player);
   const hit = hitTestAnnotation(player, point);
 
-  if (!hit || hit.annotation.type !== "line") {
+  if (!hit || !["line", "angle", "marker"].includes(hit.annotation.type)) {
     hideContextMenu();
     return;
   }
@@ -362,6 +383,9 @@ function showContextMenu(event, player) {
   };
   els.contextMenu.style.left = `${event.clientX}px`;
   els.contextMenu.style.top = `${event.clientY}px`;
+  els.calibrateAction.hidden = hit.annotation.type !== "line";
+  els.reverseAngleAction.hidden = hit.annotation.type !== "angle";
+  els.trackMarkerAction.hidden = hit.annotation.type !== "marker";
   els.contextMenu.hidden = false;
   drawAllOverlays();
 }
@@ -409,6 +433,232 @@ function calibrateSelectedLine() {
   drawAllOverlays();
 }
 
+function reverseSelectedAngleSign() {
+  const context = state.contextMenu;
+  hideContextMenu();
+  if (!context) return;
+
+  const player = playerById(context.playerId);
+  const annotation = annotationById(context.annotationId);
+  if (!player || !annotation || annotation.type !== "angle") return;
+
+  annotation.options = annotation.options ?? {};
+  annotation.options.invertAngleSign = !annotation.options.invertAngleSign;
+  updateAnnotationMetrics(annotation, player);
+  updateExports();
+  drawAllOverlays();
+}
+
+function markerForTracking(player) {
+  const selected = annotationById(state.selectedAnnotationId);
+  if (selected?.playerId === player.id && selected.type === "marker") return selected;
+
+  const markers = annotationsForFrame(player.id).filter((annotation) => annotation.type === "marker");
+  return markers.at(-1) ?? null;
+}
+
+function seekVideoTo(player, sourceTime) {
+  const video = player.video;
+  if (!video) return Promise.resolve();
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      video.removeEventListener("seeked", done);
+      resolve();
+    };
+
+    if (Math.abs(video.currentTime - sourceTime) <= 0.002 && video.readyState >= 2) {
+      requestAnimationFrame(done);
+      return;
+    }
+
+    video.addEventListener("seeked", done, { once: true });
+    video.currentTime = sourceTime;
+    window.setTimeout(done, 900);
+  });
+}
+
+function captureVideoFrame(player) {
+  const video = player.video;
+  if (!video?.videoWidth || !video?.videoHeight) return null;
+  const canvas = player.frameCanvas ?? document.createElement("canvas");
+  player.frameCanvas = canvas;
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  return ctx.getImageData(0, 0, canvas.width, canvas.height);
+}
+
+function grayAt(imageData, x, y) {
+  const index = (y * imageData.width + x) * 4;
+  const data = imageData.data;
+  return 0.299 * data[index] + 0.587 * data[index + 1] + 0.114 * data[index + 2];
+}
+
+function extractTemplate(imageData, point, halfSize) {
+  const centerX = Math.round(point.x * imageData.width);
+  const centerY = Math.round(point.y * imageData.height);
+  const size = halfSize * 2 + 1;
+  if (
+    centerX - halfSize < 0 ||
+    centerY - halfSize < 0 ||
+    centerX + halfSize >= imageData.width ||
+    centerY + halfSize >= imageData.height
+  ) {
+    return null;
+  }
+
+  const values = new Float32Array(size * size);
+  let offset = 0;
+  for (let y = centerY - halfSize; y <= centerY + halfSize; y++) {
+    for (let x = centerX - halfSize; x <= centerX + halfSize; x++) {
+      values[offset++] = grayAt(imageData, x, y);
+    }
+  }
+
+  return { values, halfSize, size };
+}
+
+function matchTemplate(imageData, template, point, searchRadius) {
+  const startX = Math.round(point.x * imageData.width);
+  const startY = Math.round(point.y * imageData.height);
+  const minX = Math.max(template.halfSize, startX - searchRadius);
+  const maxX = Math.min(imageData.width - template.halfSize - 1, startX + searchRadius);
+  const minY = Math.max(template.halfSize, startY - searchRadius);
+  const maxY = Math.min(imageData.height - template.halfSize - 1, startY + searchRadius);
+  let bestScore = Number.POSITIVE_INFINITY;
+  let bestX = startX;
+  let bestY = startY;
+
+  for (let y = minY; y <= maxY; y++) {
+    for (let x = minX; x <= maxX; x++) {
+      let score = 0;
+      let offset = 0;
+      for (let ty = y - template.halfSize; ty <= y + template.halfSize; ty++) {
+        for (let tx = x - template.halfSize; tx <= x + template.halfSize; tx++) {
+          score += Math.abs(grayAt(imageData, tx, ty) - template.values[offset++]);
+        }
+      }
+      if (score < bestScore) {
+        bestScore = score;
+        bestX = x;
+        bestY = y;
+      }
+    }
+  }
+
+  return {
+    point: {
+      x: clamp(bestX / imageData.width, 0, 1),
+      y: clamp(bestY / imageData.height, 0, 1),
+    },
+    confidence: clamp(1 - bestScore / (template.values.length * 255), 0, 1),
+  };
+}
+
+function enrichTrackKinematics(track, player) {
+  for (let index = 0; index < track.samples.length; index++) {
+    const sample = track.samples[index];
+    if (index === 0) {
+      sample.speedPxPerSec = 0;
+      if (player.calibration?.pixelsPerUnit) sample.speedRealPerSec = 0;
+      continue;
+    }
+
+    const previous = track.samples[index - 1];
+    const dt = sample.analysisTime - previous.analysisTime;
+    const distancePx = distancePixels(previous, sample, player);
+    sample.speedPxPerSec = dt > EPSILON ? Number((distancePx / dt).toFixed(3)) : 0;
+    if (player.calibration?.pixelsPerUnit) {
+      sample.speedRealPerSec = Number((sample.speedPxPerSec / player.calibration.pixelsPerUnit).toFixed(4));
+      sample.unit = `${player.calibration.unit}/s`;
+    }
+  }
+}
+
+async function trackSelectedMarkerForward(player = activePlayer()) {
+  hideContextMenu();
+  if (!player) return;
+  const marker = markerForTracking(player);
+  if (!marker) {
+    window.alert("먼저 마커를 만들거나 선택한 뒤 T 버튼 또는 우클릭 Track을 사용하세요.");
+    return;
+  }
+
+  const frameCount = Number(window.prompt("앞으로 몇 프레임 추적할까요?", "60"));
+  if (!Number.isFinite(frameCount) || frameCount <= 0) return;
+
+  setPlaying(false);
+  const fps = player.fps ?? DEFAULT_FPS;
+  const startAnalysisTime = marker.analysisTime;
+  const maxAnalysisTime = analysisDuration();
+  const halfSize = 8;
+  const searchRadius = 36;
+  let point = { ...marker.points[0] };
+
+  await seekVideoTo(player, sourceTimeFor(player, startAnalysisTime));
+  let imageData = captureVideoFrame(player);
+  let template = imageData ? extractTemplate(imageData, point, halfSize) : null;
+  if (!template) {
+    window.alert("마커가 영상 가장자리와 너무 가깝습니다. 조금 안쪽에 마커를 놓고 다시 시도하세요.");
+    return;
+  }
+
+  const track = {
+    id: uid(),
+    playerId: player.id,
+    sourceAnnotationId: marker.id,
+    label: `track-${state.tracks.length + 1}`,
+    type: "marker",
+    analysisStart: Number(startAnalysisTime.toFixed(6)),
+    fps,
+    templateSize: halfSize * 2 + 1,
+    searchRadius,
+    samples: [],
+  };
+
+  for (let frame = 0; frame <= frameCount; frame++) {
+    const analysisTime = startAnalysisTime + frame / fps;
+    if (analysisTime > maxAnalysisTime) break;
+    await seekVideoTo(player, sourceTimeFor(player, analysisTime));
+    imageData = captureVideoFrame(player);
+    if (!imageData) break;
+
+    if (frame > 0) {
+      const match = matchTemplate(imageData, template, point, searchRadius);
+      point = match.point;
+      track.samples.push({
+        analysisTime: Number(analysisTime.toFixed(6)),
+        sourceTime: Number(sourceTimeFor(player, analysisTime).toFixed(6)),
+        x: Number(point.x.toFixed(6)),
+        y: Number(point.y.toFixed(6)),
+        confidence: Number(match.confidence.toFixed(4)),
+      });
+    } else {
+      track.samples.push({
+        analysisTime: Number(analysisTime.toFixed(6)),
+        sourceTime: Number(sourceTimeFor(player, analysisTime).toFixed(6)),
+        x: Number(point.x.toFixed(6)),
+        y: Number(point.y.toFixed(6)),
+        confidence: 1,
+      });
+    }
+
+    const nextTemplate = extractTemplate(imageData, point, halfSize);
+    if (nextTemplate) template = nextTemplate;
+  }
+
+  enrichTrackKinematics(track, player);
+  state.tracks.push(track);
+  state.selectedAnnotationId = marker.id;
+  updateExports();
+  seekAll(startAnalysisTime);
+}
+
 function playerCard(player) {
   const sourceTime = sourceTimeFor(player);
   return `
@@ -428,6 +678,7 @@ function playerCard(player) {
           <button type="button" data-tool="marker" title="마커">+</button>
           <button type="button" data-tool="line" title="거리">/</button>
           <button type="button" data-tool="angle" title="3마커 각도">A</button>
+          <button type="button" data-action="track-marker" title="선택 마커 트래킹">T</button>
         </div>
       </div>
       <div class="trim-grid">
@@ -453,6 +704,11 @@ function renderPlayers() {
     player.canvas = canvas;
 
     card.querySelector('[data-action="activate"]').addEventListener("click", () => setActivePlayer(player.id));
+    card.querySelector('[data-action="track-marker"]').addEventListener("click", (event) => {
+      event.stopPropagation();
+      setActivePlayer(player.id);
+      trackSelectedMarkerForward(player);
+    });
     card.addEventListener("pointerdown", () => setActivePlayer(player.id));
     canvas.addEventListener("pointerdown", (event) => handleCanvasPointerDown(event, player));
     canvas.addEventListener("pointermove", (event) => handleCanvasPointerMove(event, player));
@@ -708,6 +964,7 @@ function drawOverlay(player) {
   ctx.lineWidth = 2 * (window.devicePixelRatio || 1);
   ctx.font = `${12 * (window.devicePixelRatio || 1)}px ui-monospace, SFMono-Regular, Consolas, monospace`;
 
+  drawTracks(ctx, player);
   annotationsForFrame(player.id).forEach((annotation) => drawAnnotation(ctx, player, annotation));
 
   if (state.currentDraft?.playerId === player.id) {
@@ -717,6 +974,35 @@ function drawOverlay(player) {
       label: "draft",
     }, true);
   }
+}
+
+function drawTracks(ctx, player) {
+  const frameTolerance = 1 / ((player.fps ?? DEFAULT_FPS) * 2);
+  const tracks = state.tracks.filter((track) => track.playerId === player.id);
+
+  tracks.forEach((track) => {
+    const trace = track.samples.filter((sample) => sample.analysisTime <= state.analysisTime).slice(-80);
+    if (trace.length >= 2) {
+      ctx.strokeStyle = "rgba(248, 212, 92, 0.62)";
+      ctx.beginPath();
+      trace.forEach((sample, index) => {
+        const point = denormalize({ x: sample.x, y: sample.y }, player);
+        if (index === 0) ctx.moveTo(point.x, point.y);
+        else ctx.lineTo(point.x, point.y);
+      });
+      ctx.stroke();
+    }
+
+    const nearest = track.samples.reduce((best, sample) => {
+      const distance = Math.abs(sample.analysisTime - state.analysisTime);
+      return !best || distance < best.distance ? { sample, distance } : best;
+    }, null);
+
+    if (nearest && nearest.distance <= frameTolerance) {
+      drawPoint(ctx, { x: nearest.sample.x, y: nearest.sample.y }, player, "#f8d45c", true);
+      drawLabel(ctx, track.label ?? "track", { x: nearest.sample.x, y: nearest.sample.y }, player);
+    }
+  });
 }
 
 function drawPoint(ctx, point, player, color = "#f8d45c", selected = false) {
@@ -777,7 +1063,7 @@ function drawAngleArc(ctx, player, annotation, color) {
     x: (pb.x + Math.cos(mid) * (radius + 18 * (window.devicePixelRatio || 1)) - videoContentRect(player, true).x) / videoContentRect(player, true).width,
     y: (pb.y + Math.sin(mid) * (radius + 18 * (window.devicePixelRatio || 1)) - videoContentRect(player, true).y) / videoContentRect(player, true).height,
   };
-  drawLabel(ctx, `${angleDegrees(a, b, c, player).toFixed(1)}°`, labelPoint, player);
+  drawLabel(ctx, formatAngle(angleForAnnotation(annotation, player)), labelPoint, player);
 }
 
 function drawAnnotation(ctx, player, annotation, isDraft = false) {
@@ -828,7 +1114,7 @@ function updateExports() {
 }
 
 function csvRows() {
-  const rows = [["annotationId", "playerId", "type", "analysisTime", "sourceTime", "metricName", "metricValue", "pointIndex", "xNorm", "yNorm"]];
+  const rows = [["id", "playerId", "type", "analysisTime", "sourceTime", "metricName", "metricValue", "pointIndex", "xNorm", "yNorm"]];
   state.annotations.forEach((annotation) => {
     const metricEntries = Object.entries(annotation.metrics ?? {});
     const metricName = metricEntries.map(([key]) => key).join("|");
@@ -845,6 +1131,28 @@ function csvRows() {
         index,
         point.x,
         point.y,
+      ]);
+    });
+  });
+  state.tracks.forEach((track) => {
+    track.samples.forEach((sample, index) => {
+      const metricPairs = [
+        ["confidence", sample.confidence],
+        ["speedPxPerSec", sample.speedPxPerSec],
+      ];
+      if (sample.speedRealPerSec !== undefined) metricPairs.push(["speedRealPerSec", sample.speedRealPerSec]);
+      if (sample.unit) metricPairs.push(["unit", sample.unit]);
+      rows.push([
+        track.id,
+        track.playerId,
+        "track-marker",
+        sample.analysisTime,
+        sample.sourceTime,
+        metricPairs.map(([key]) => key).join("|"),
+        metricPairs.map(([, value]) => value).join("|"),
+        index,
+        sample.x,
+        sample.y,
       ]);
     });
   });
@@ -878,6 +1186,12 @@ document.addEventListener("click", (event) => {
   setTool(button.dataset.tool);
 });
 els.calibrateAction.addEventListener("click", calibrateSelectedLine);
+els.reverseAngleAction.addEventListener("click", reverseSelectedAngleSign);
+els.trackMarkerAction.addEventListener("click", () => {
+  const context = state.contextMenu;
+  const player = context ? playerById(context.playerId) : activePlayer();
+  trackSelectedMarkerForward(player);
+});
 document.addEventListener("pointerdown", (event) => {
   if (!els.contextMenu.hidden && !event.target.closest("#contextMenu")) hideContextMenu();
 });
