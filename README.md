@@ -22,6 +22,7 @@ python -m http.server 5173
 - 마커, 거리, 3마커 각도 annotation
 - signed angle 및 각도 부호 반전 옵션
 - 브라우저 내 marker tracking MVP
+- 트래킹 박스 ROI 기반 tracking seed
 - 프로젝트 JSON export
 - annotation CSV export
 
@@ -46,4 +47,4 @@ sourceTime = analysisTime + sourceIn + syncOffset
 - AI pose: 외부 서비스 결과를 `analysisTime` 기준 joint track으로 import
 - 마커 트래킹: 초기 ROI 지정 후 frame-by-frame 좌표를 `tracks.samples`에 저장
 
-현재 트래킹은 `hybrid-zncc-color-blob-predictive-v2`입니다. 초기 템플릿을 고정 앵커로 유지하고, confidence가 높은 프레임에서만 adaptive template을 갱신합니다. 검색 중심은 이전 속도 기반 예측점이며, template matching 점수는 normalized correlation, 색상 유사도, 대비 안정성, 거리 penalty를 조합합니다. 투포환/공처럼 배경과 색상 차이가 있는 물체는 seed 주변 foreground/background 색상 모델로 blob 중심도 같이 추정한 뒤 template 후보와 결합합니다. 결과 좌표는 confidence-weighted smoothing 후 속도를 계산합니다.
+현재 트래킹은 `hybrid-zncc-color-blob-predictive-v2`입니다. 마커 한 점보다 `□` 트래킹 박스로 물체 전체를 감싸고 `T`를 누르는 방식이 권장됩니다. 초기 템플릿을 고정 앵커로 유지하고, confidence가 높은 프레임에서만 adaptive template을 갱신합니다. 검색 중심은 이전 속도 기반 예측점이며, template matching 점수는 normalized correlation, 색상 유사도, 대비 안정성, 거리 penalty를 조합합니다. 투포환/공처럼 배경과 색상 차이가 있는 물체는 seed 주변 foreground/background 색상 모델로 blob 중심도 같이 추정한 뒤 template 후보와 결합합니다. 결과 좌표는 confidence-weighted smoothing 후 속도를 계산합니다.

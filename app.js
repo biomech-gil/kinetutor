@@ -214,6 +214,25 @@ function midpoint(a, b) {
   };
 }
 
+function rectFromPoints(a, b) {
+  const x = Math.min(a.x, b.x);
+  const y = Math.min(a.y, b.y);
+  return {
+    x,
+    y,
+    width: Math.abs(a.x - b.x),
+    height: Math.abs(a.y - b.y),
+    center: {
+      x: x + Math.abs(a.x - b.x) / 2,
+      y: y + Math.abs(a.y - b.y) / 2,
+    },
+  };
+}
+
+function pointInsideRect(point, rect) {
+  return point.x >= rect.x && point.x <= rect.x + rect.width && point.y >= rect.y && point.y <= rect.y + rect.height;
+}
+
 function angleDegrees(a, b, c, player, invertSign = false) {
   const pa = sourcePixelPoint(a, player);
   const pb = sourcePixelPoint(b, player);
@@ -348,6 +367,11 @@ function hitTestAnnotation(player, point) {
       }
     }
 
+    if (annotation.type === "trackbox" && annotation.points.length >= 2) {
+      const rect = rectFromPoints(annotation.points[0], annotation.points[1]);
+      if (pointInsideRect(point, rect)) return { annotation, mode: "body" };
+    }
+
     if (annotation.type === "angle" && annotation.points.length >= 3) {
       const [a, b, c] = annotation.points;
       const nearArm = distanceToSegment(point, a, b, player) <= bodyRadius || distanceToSegment(point, b, c, player) <= bodyRadius;
@@ -371,7 +395,7 @@ function showContextMenu(event, player) {
   const point = normalizedPoint(event, player);
   const hit = hitTestAnnotation(player, point);
 
-  if (!hit || !["line", "angle", "marker"].includes(hit.annotation.type)) {
+  if (!hit || !["line", "angle", "marker", "trackbox"].includes(hit.annotation.type)) {
     hideContextMenu();
     return;
   }
@@ -385,7 +409,7 @@ function showContextMenu(event, player) {
   els.contextMenu.style.top = `${event.clientY}px`;
   els.calibrateAction.hidden = hit.annotation.type !== "line";
   els.reverseAngleAction.hidden = hit.annotation.type !== "angle";
-  els.trackMarkerAction.hidden = hit.annotation.type !== "marker";
+  els.trackMarkerAction.hidden = !["marker", "trackbox"].includes(hit.annotation.type);
   els.contextMenu.hidden = false;
   drawAllOverlays();
 }
@@ -449,16 +473,41 @@ function reverseSelectedAngleSign() {
   drawAllOverlays();
 }
 
-function markerForTracking(player) {
+function trackingTargetForPlayer(player) {
   const selected = annotationById(state.selectedAnnotationId);
-  if (selected?.playerId === player.id && selected.type === "marker") return selected;
+  if (selected?.playerId === player.id && ["marker", "trackbox"].includes(selected.type)) return selected;
 
-  const markers = annotationsForFrame(player.id).filter((annotation) => annotation.type === "marker");
-  if (markers.length) return markers.at(-1);
+  const currentTargets = annotationsForFrame(player.id).filter((annotation) => ["marker", "trackbox"].includes(annotation.type));
+  if (currentTargets.length) return currentTargets.at(-1);
 
   return state.annotations
-    .filter((annotation) => annotation.playerId === player.id && annotation.type === "marker")
+    .filter((annotation) => annotation.playerId === player.id && ["marker", "trackbox"].includes(annotation.type))
     .sort((a, b) => Math.abs(a.analysisTime - state.analysisTime) - Math.abs(b.analysisTime - state.analysisTime))[0] ?? null;
+}
+
+function trackingSeed(target, player) {
+  if (target.type === "trackbox" && target.points.length >= 2) {
+    const rect = rectFromPoints(target.points[0], target.points[1]);
+    const videoWidth = player.video?.videoWidth || 1280;
+    const videoHeight = player.video?.videoHeight || 720;
+    const halfSize = clamp(Math.round(Math.max(rect.width * videoWidth, rect.height * videoHeight) / 2), 8, 24);
+    return {
+      point: rect.center,
+      halfSize,
+      roiNorm: {
+        width: Math.max(rect.width, halfSize * 2 / videoWidth),
+        height: Math.max(rect.height, halfSize * 2 / videoHeight),
+      },
+      seedType: "trackbox",
+    };
+  }
+
+  return {
+    point: { ...target.points[0] },
+    halfSize: 9,
+    roiNorm: null,
+    seedType: "marker",
+  };
 }
 
 function seekVideoTo(player, sourceTime) {
@@ -895,15 +944,15 @@ function smoothTrackSamples(track) {
 async function trackSelectedMarkerForward(player = activePlayer()) {
   hideContextMenu();
   if (!player) return;
-  const marker = markerForTracking(player);
-  if (!marker) {
-    window.alert("먼저 마커를 만들거나 선택한 뒤 T 버튼 또는 우클릭 Track을 사용하세요.");
+  const target = trackingTargetForPlayer(player);
+  if (!target) {
+    window.alert("먼저 마커를 찍거나 트래킹 박스를 드래그한 뒤 T 버튼 또는 우클릭 Track을 사용하세요.");
     return;
   }
 
   setPlaying(false);
   const fps = player.fps ?? DEFAULT_FPS;
-  const startAnalysisTime = marker.analysisTime;
+  const startAnalysisTime = target.analysisTime;
   const maxAnalysisTime = analysisDuration();
   const remainingFrames = Math.max(0, Math.floor((maxAnalysisTime - startAnalysisTime) * fps));
   const frameCount = parseTrackingFrameCount(
@@ -912,11 +961,12 @@ async function trackSelectedMarkerForward(player = activePlayer()) {
   );
   if (!frameCount) return;
 
-  const halfSize = 9;
+  const seed = trackingSeed(target, player);
+  const halfSize = seed.halfSize;
   const baseSearchRadius = 44;
   const updateThreshold = 0.68;
   const recoveryThreshold = 0.46;
-  let point = { ...marker.points[0] };
+  let point = { ...seed.point };
 
   await seekVideoTo(player, sourceTimeFor(player, startAnalysisTime));
   let imageData = captureVideoFrame(player);
@@ -931,9 +981,11 @@ async function trackSelectedMarkerForward(player = activePlayer()) {
   const track = {
     id: uid(),
     playerId: player.id,
-    sourceAnnotationId: marker.id,
+    sourceAnnotationId: target.id,
     label: `track-${state.tracks.length + 1}`,
     type: "marker",
+    seedType: seed.seedType,
+    roiNorm: seed.roiNorm,
     algorithm: "hybrid-zncc-color-blob-predictive-v2",
     analysisStart: Number(startAnalysisTime.toFixed(6)),
     fps,
@@ -1028,7 +1080,7 @@ async function trackSelectedMarkerForward(player = activePlayer()) {
     track.unit = player.calibration.unit;
   }
   state.tracks.push(track);
-  state.selectedAnnotationId = marker.id;
+  state.selectedAnnotationId = target.id;
   updateExports();
   seekAll(startAnalysisTime);
   els.playPause.textContent = "▶";
@@ -1056,7 +1108,8 @@ function playerCard(player) {
           <button type="button" data-tool="marker" title="마커">+</button>
           <button type="button" data-tool="line" title="거리">/</button>
           <button type="button" data-tool="angle" title="3마커 각도">A</button>
-          <button type="button" data-action="track-marker" title="선택 마커 트래킹">T</button>
+          <button type="button" data-tool="trackbox" title="트래킹 박스">□</button>
+          <button type="button" data-action="track-marker" title="선택 마커/박스 트래킹">T</button>
         </div>
       </div>
       <div class="trim-grid">
@@ -1197,6 +1250,20 @@ function handleCanvasPointerDown(event, player) {
       playerId: player.id,
       annotationId: annotation.id,
       pointIndex: 0,
+      pointerId: event.pointerId,
+    };
+    drawAllOverlays();
+    return;
+  }
+
+  if (state.selectedTool === "trackbox") {
+    const annotation = createAnnotation(player, "trackbox", [point, point]);
+    state.selectedAnnotationId = annotation.id;
+    state.interaction = {
+      type: "drag-point",
+      playerId: player.id,
+      annotationId: annotation.id,
+      pointIndex: 1,
       pointerId: event.pointerId,
     };
     drawAllOverlays();
@@ -1355,21 +1422,9 @@ function drawOverlay(player) {
 }
 
 function drawTracks(ctx, player) {
-  const frameTolerance = 1 / ((player.fps ?? DEFAULT_FPS) * 2);
   const tracks = state.tracks.filter((track) => track.playerId === player.id);
 
   tracks.forEach((track) => {
-    if (track.samples.length >= 2) {
-      ctx.strokeStyle = "rgba(248, 212, 92, 0.24)";
-      ctx.beginPath();
-      track.samples.forEach((sample, index) => {
-        const point = denormalize({ x: sample.x, y: sample.y }, player);
-        if (index === 0) ctx.moveTo(point.x, point.y);
-        else ctx.lineTo(point.x, point.y);
-      });
-      ctx.stroke();
-    }
-
     const trace = track.samples.filter((sample) => sample.analysisTime <= state.analysisTime).slice(-80);
     if (trace.length >= 2) {
       ctx.strokeStyle = "rgba(248, 212, 92, 0.78)";
@@ -1382,16 +1437,35 @@ function drawTracks(ctx, player) {
       ctx.stroke();
     }
 
-    const nearest = track.samples.reduce((best, sample) => {
-      const distance = Math.abs(sample.analysisTime - state.analysisTime);
-      return !best || distance < best.distance ? { sample, distance } : best;
-    }, null);
-
-    if (nearest && nearest.distance <= frameTolerance) {
-      drawPoint(ctx, { x: nearest.sample.x, y: nearest.sample.y }, player, "#f8d45c", true);
-      drawLabel(ctx, track.label ?? "track", { x: nearest.sample.x, y: nearest.sample.y }, player);
+    const current = sampleAtTrackTime(track, state.analysisTime);
+    if (current) {
+      const point = { x: current.x, y: current.y };
+      drawPoint(ctx, point, player, "#f8d45c", true);
+      if (track.roiNorm) drawTrackBox(ctx, point, track.roiNorm, player);
+      drawLabel(ctx, `${track.label ?? "track"} ${Math.round((current.confidence ?? 0) * 100)}%`, point, player);
     }
   });
+}
+
+function sampleAtTrackTime(track, analysisTime) {
+  if (!track.samples.length) return null;
+  if (analysisTime < track.samples[0].analysisTime || analysisTime > track.samples.at(-1).analysisTime) return null;
+
+  for (let index = 0; index < track.samples.length - 1; index++) {
+    const current = track.samples[index];
+    const next = track.samples[index + 1];
+    if (analysisTime >= current.analysisTime && analysisTime <= next.analysisTime) {
+      const span = next.analysisTime - current.analysisTime;
+      const t = span > EPSILON ? (analysisTime - current.analysisTime) / span : 0;
+      return {
+        x: current.x + (next.x - current.x) * t,
+        y: current.y + (next.y - current.y) * t,
+        confidence: current.confidence + ((next.confidence ?? current.confidence) - current.confidence) * t,
+      };
+    }
+  }
+
+  return track.samples.at(-1);
 }
 
 function drawPoint(ctx, point, player, color = "#f8d45c", selected = false) {
@@ -1413,6 +1487,24 @@ function drawLine(ctx, a, b, player, color = "#4ee0b5") {
   ctx.moveTo(pa.x, pa.y);
   ctx.lineTo(pb.x, pb.y);
   ctx.stroke();
+}
+
+function drawRect(ctx, rect, player, color = "#4ee0b5") {
+  const topLeft = denormalize({ x: rect.x, y: rect.y }, player);
+  const bottomRight = denormalize({ x: rect.x + rect.width, y: rect.y + rect.height }, player);
+  ctx.strokeStyle = color;
+  ctx.setLineDash([6 * (window.devicePixelRatio || 1), 4 * (window.devicePixelRatio || 1)]);
+  ctx.strokeRect(topLeft.x, topLeft.y, bottomRight.x - topLeft.x, bottomRight.y - topLeft.y);
+  ctx.setLineDash([]);
+}
+
+function drawTrackBox(ctx, center, roiNorm, player) {
+  drawRect(ctx, {
+    x: clamp(center.x - roiNorm.width / 2, 0, 1),
+    y: clamp(center.y - roiNorm.height / 2, 0, 1),
+    width: roiNorm.width,
+    height: roiNorm.height,
+  }, player, "#f8d45c");
 }
 
 function drawLabel(ctx, text, point, player) {
@@ -1471,6 +1563,12 @@ function drawAnnotation(ctx, player, annotation, isDraft = false) {
       drawLine(ctx, annotation.points[1], annotation.points[2], player, color);
       drawAngleArc(ctx, player, annotation, color);
     }
+  }
+
+  if (annotation.type === "trackbox" && annotation.points.length >= 2) {
+    const rect = rectFromPoints(annotation.points[0], annotation.points[1]);
+    drawRect(ctx, rect, player, color);
+    drawLabel(ctx, "tracking ROI", rect.center, player);
   }
 
   if (annotation.type === "marker" && annotation.points.length) {
