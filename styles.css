@@ -98,7 +98,7 @@ h2 {
   display: grid;
   grid-template-columns: minmax(17rem, 22rem) minmax(0, 1fr);
   gap: 1rem;
-  padding: 0 clamp(1rem, 3vw, 2.5rem) 6rem;
+  padding: 0 clamp(1rem, 3vw, 2.5rem) 8.5rem;
 }
 
 .panel {
@@ -123,12 +123,6 @@ h2 {
   display: grid;
   gap: 1rem;
   padding: 1rem;
-}
-
-.tool-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0.55rem;
 }
 
 .hint {
@@ -288,6 +282,52 @@ textarea {
   padding: 0.6rem;
 }
 
+.tool-dock {
+  position: fixed;
+  left: 50%;
+  bottom: 5.4rem;
+  z-index: 11;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  transform: translateX(-50%);
+  border: 1px solid rgba(23, 33, 29, 0.12);
+  border-radius: 999px;
+  background: rgba(15, 21, 19, 0.88);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(18px);
+  padding: 0.4rem;
+}
+
+.tool-dock button {
+  display: grid;
+  grid-template-columns: auto auto;
+  align-items: center;
+  gap: 0.35rem;
+  min-width: 4.2rem;
+  border-color: rgba(255, 250, 240, 0.16);
+  background: rgba(255, 250, 240, 0.08);
+  color: var(--paper);
+  padding: 0.45rem 0.65rem;
+}
+
+.tool-dock button.active {
+  background: var(--paper);
+  border-color: var(--paper);
+  color: var(--dark);
+}
+
+.tool-icon {
+  display: grid;
+  place-items: center;
+  width: 1.35rem;
+  height: 1.35rem;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.14);
+  font-weight: 800;
+  line-height: 1;
+}
+
 input[type="range"] {
   accent-color: var(--accent-2);
 }
@@ -322,5 +362,16 @@ output {
   .transport output {
     grid-column: 1 / -1;
     width: 100%;
+  }
+
+  .tool-dock {
+    right: 1rem;
+    left: 1rem;
+    justify-content: center;
+    transform: none;
+  }
+
+  .tool-dock button {
+    min-width: 0;
   }
 }

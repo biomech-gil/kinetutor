@@ -21,13 +21,7 @@
     <main class="app-shell">
       <aside class="panel">
         <section>
-          <h2>측정 도구</h2>
-          <div class="tool-grid">
-            <button data-tool="select">선택</button>
-            <button data-tool="marker">마커</button>
-            <button data-tool="line">거리</button>
-            <button data-tool="angle">3마커 각도</button>
-          </div>
+          <h2>측정 안내</h2>
           <p class="hint">각도는 첫 점-관절점-끝 점 순서로 찍습니다. 모든 좌표는 공통 분석 시간 기준으로 저장됩니다.</p>
         </section>
 
@@ -49,6 +43,25 @@
         <div id="playerGrid" class="player-grid"></div>
       </section>
     </main>
+
+    <nav class="tool-dock" aria-label="측정 도구">
+      <button data-tool="select" title="선택">
+        <span class="tool-icon">↖</span>
+        <span>선택</span>
+      </button>
+      <button data-tool="marker" title="마커">
+        <span class="tool-icon">●</span>
+        <span>마커</span>
+      </button>
+      <button data-tool="line" title="거리">
+        <span class="tool-icon">╱</span>
+        <span>거리</span>
+      </button>
+      <button data-tool="angle" title="3마커 각도">
+        <span class="tool-icon">∠</span>
+        <span>각도</span>
+      </button>
+    </nav>
 
     <footer class="transport">
       <button id="stepBack">-1 frame</button>

@@ -71,7 +71,8 @@ function isPlayerInsideTrim(player, analysisTime = state.analysisTime) {
 function syncVideoElement(player, shouldPlay = false) {
   if (!player.video) return;
   const target = sourceTimeFor(player);
-  if (Math.abs(player.video.currentTime - target) > 0.015) {
+  const tolerance = shouldPlay ? 0.09 : 0.015;
+  if (Math.abs(player.video.currentTime - target) > tolerance) {
     player.video.currentTime = target;
   }
 
@@ -92,7 +93,13 @@ function activePlayer() {
 
 function setActivePlayer(playerId) {
   state.activePlayerId = playerId;
-  renderPlayers();
+  updateActivePlayerUI();
+}
+
+function updateActivePlayerUI() {
+  els.playerGrid.querySelectorAll(".player-card").forEach((card) => {
+    card.classList.toggle("active", card.dataset.playerId === state.activePlayerId);
+  });
 }
 
 function setTool(tool) {
@@ -281,6 +288,7 @@ function renderPlayers() {
   });
 
   updateTimeline();
+  updateActivePlayerUI();
   drawAllOverlays();
 }
 
@@ -293,6 +301,7 @@ function resizeCanvas(player) {
 }
 
 function handleCanvasClick(event, player) {
+  event.stopPropagation();
   if (state.selectedTool === "select") return;
   setActivePlayer(player.id);
   const point = normalizedPoint(event, player);
@@ -362,10 +371,16 @@ function seekAll(analysisTime) {
 }
 
 function setPlaying(playing) {
+  if (!state.players.length) return;
   state.playing = playing;
   state.lastTick = performance.now();
   els.playPause.textContent = playing ? "정지" : "재생";
-  if (playing) requestAnimationFrame(tick);
+  if (playing) {
+    state.players.forEach((player) => syncVideoElement(player, true));
+    requestAnimationFrame(tick);
+  } else {
+    state.players.forEach((player) => syncVideoElement(player, false));
+  }
 }
 
 function tick(now) {
