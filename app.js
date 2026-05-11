@@ -499,6 +499,16 @@ function grayAt(imageData, x, y) {
   return 0.299 * data[index] + 0.587 * data[index + 1] + 0.114 * data[index + 2];
 }
 
+function rgbAt(imageData, x, y) {
+  const index = (y * imageData.width + x) * 4;
+  const data = imageData.data;
+  return {
+    r: data[index],
+    g: data[index + 1],
+    b: data[index + 2],
+  };
+}
+
 function extractTemplate(imageData, point, halfSize) {
   const centerX = Math.round(point.x * imageData.width);
   const centerY = Math.round(point.y * imageData.height);
@@ -514,49 +524,142 @@ function extractTemplate(imageData, point, halfSize) {
 
   const values = new Float32Array(size * size);
   let offset = 0;
+  let sum = 0;
+  let sumR = 0;
+  let sumG = 0;
+  let sumB = 0;
   for (let y = centerY - halfSize; y <= centerY + halfSize; y++) {
     for (let x = centerX - halfSize; x <= centerX + halfSize; x++) {
-      values[offset++] = grayAt(imageData, x, y);
+      const gray = grayAt(imageData, x, y);
+      const rgb = rgbAt(imageData, x, y);
+      values[offset++] = gray;
+      sum += gray;
+      sumR += rgb.r;
+      sumG += rgb.g;
+      sumB += rgb.b;
     }
   }
 
-  return { values, halfSize, size };
+  const mean = sum / values.length;
+  let variance = 0;
+  values.forEach((value) => {
+    variance += (value - mean) ** 2;
+  });
+
+  return {
+    values,
+    halfSize,
+    size,
+    mean,
+    variance,
+    stdev: Math.sqrt(variance / values.length),
+    rgbMean: {
+      r: sumR / values.length,
+      g: sumG / values.length,
+      b: sumB / values.length,
+    },
+  };
 }
 
-function matchTemplate(imageData, template, point, searchRadius) {
-  const startX = Math.round(point.x * imageData.width);
-  const startY = Math.round(point.y * imageData.height);
-  const minX = Math.max(template.halfSize, startX - searchRadius);
-  const maxX = Math.min(imageData.width - template.halfSize - 1, startX + searchRadius);
-  const minY = Math.max(template.halfSize, startY - searchRadius);
-  const maxY = Math.min(imageData.height - template.halfSize - 1, startY + searchRadius);
-  let bestScore = Number.POSITIVE_INFINITY;
-  let bestX = startX;
-  let bestY = startY;
+function compareTemplateAt(imageData, template, x, y, centerX, centerY, searchRadius) {
+  let sum = 0;
+  let sumSq = 0;
+  let sumR = 0;
+  let sumG = 0;
+  let sumB = 0;
+  let offset = 0;
 
-  for (let y = minY; y <= maxY; y++) {
-    for (let x = minX; x <= maxX; x++) {
-      let score = 0;
-      let offset = 0;
-      for (let ty = y - template.halfSize; ty <= y + template.halfSize; ty++) {
-        for (let tx = x - template.halfSize; tx <= x + template.halfSize; tx++) {
-          score += Math.abs(grayAt(imageData, tx, ty) - template.values[offset++]);
-        }
+  for (let ty = y - template.halfSize; ty <= y + template.halfSize; ty++) {
+    for (let tx = x - template.halfSize; tx <= x + template.halfSize; tx++) {
+      const gray = grayAt(imageData, tx, ty);
+      const rgb = rgbAt(imageData, tx, ty);
+      sum += gray;
+      sumSq += gray * gray;
+      sumR += rgb.r;
+      sumG += rgb.g;
+      sumB += rgb.b;
+      offset++;
+    }
+  }
+
+  const n = template.values.length;
+  const mean = sum / n;
+  const variance = Math.max(sumSq - n * mean * mean, 0);
+  let covariance = 0;
+  offset = 0;
+  for (let ty = y - template.halfSize; ty <= y + template.halfSize; ty++) {
+    for (let tx = x - template.halfSize; tx <= x + template.halfSize; tx++) {
+      covariance += (grayAt(imageData, tx, ty) - mean) * (template.values[offset++] - template.mean);
+    }
+  }
+
+  const zncc = template.variance > EPSILON && variance > EPSILON
+    ? covariance / Math.sqrt(template.variance * variance)
+    : 0;
+  const grayScore = clamp((zncc + 1) / 2, 0, 1);
+  const rgbMean = {
+    r: sumR / n,
+    g: sumG / n,
+    b: sumB / n,
+  };
+  const colorDistance = Math.hypot(
+    rgbMean.r - template.rgbMean.r,
+    rgbMean.g - template.rgbMean.g,
+    rgbMean.b - template.rgbMean.b,
+  );
+  const colorScore = clamp(1 - colorDistance / 441.7, 0, 1);
+  const contrastRatio = template.stdev > EPSILON
+    ? clamp(Math.sqrt(variance / n) / template.stdev, 0, 2)
+    : 1;
+  const contrastScore = 1 - Math.min(Math.abs(1 - contrastRatio), 1);
+  const distancePenalty = Math.hypot(x - centerX, y - centerY) / Math.max(searchRadius, 1);
+
+  return 0.68 * grayScore + 0.20 * colorScore + 0.08 * contrastScore - 0.04 * distancePenalty;
+}
+
+function searchTemplates(imageData, templates, centerPoint, searchRadius, step = 3) {
+  const primary = templates[0];
+  const centerX = Math.round(centerPoint.x * imageData.width);
+  const centerY = Math.round(centerPoint.y * imageData.height);
+  const minX = Math.max(primary.halfSize, centerX - searchRadius);
+  const maxX = Math.min(imageData.width - primary.halfSize - 1, centerX + searchRadius);
+  const minY = Math.max(primary.halfSize, centerY - searchRadius);
+  const maxY = Math.min(imageData.height - primary.halfSize - 1, centerY + searchRadius);
+  let best = {
+    score: Number.NEGATIVE_INFINITY,
+    x: clamp(centerX, minX, maxX),
+    y: clamp(centerY, minY, maxY),
+  };
+
+  for (let y = minY; y <= maxY; y += step) {
+    for (let x = minX; x <= maxX; x += step) {
+      for (const template of templates) {
+        const score = compareTemplateAt(imageData, template, x, y, centerX, centerY, searchRadius);
+        if (score > best.score) best = { score, x, y };
       }
-      if (score < bestScore) {
-        bestScore = score;
-        bestX = x;
-        bestY = y;
+    }
+  }
+
+  const refineRadius = Math.max(step + 2, 4);
+  const refineMinX = Math.max(primary.halfSize, best.x - refineRadius);
+  const refineMaxX = Math.min(imageData.width - primary.halfSize - 1, best.x + refineRadius);
+  const refineMinY = Math.max(primary.halfSize, best.y - refineRadius);
+  const refineMaxY = Math.min(imageData.height - primary.halfSize - 1, best.y + refineRadius);
+  for (let y = refineMinY; y <= refineMaxY; y++) {
+    for (let x = refineMinX; x <= refineMaxX; x++) {
+      for (const template of templates) {
+        const score = compareTemplateAt(imageData, template, x, y, centerX, centerY, searchRadius);
+        if (score > best.score) best = { score, x, y };
       }
     }
   }
 
   return {
     point: {
-      x: clamp(bestX / imageData.width, 0, 1),
-      y: clamp(bestY / imageData.height, 0, 1),
+      x: clamp(best.x / imageData.width, 0, 1),
+      y: clamp(best.y / imageData.height, 0, 1),
     },
-    confidence: clamp(1 - bestScore / (template.values.length * 255), 0, 1),
+    confidence: Number(clamp(best.score, 0, 1).toFixed(4)),
   };
 }
 
@@ -580,6 +683,64 @@ function enrichTrackKinematics(track, player) {
   }
 }
 
+function parseTrackingFrameCount(value, remainingFrames) {
+  const trimmed = value.trim().toLowerCase();
+  if (!trimmed || trimmed === "all" || trimmed === "end" || trimmed === "끝") return remainingFrames;
+  const frameCount = Number(trimmed);
+  return Number.isFinite(frameCount) && frameCount > 0 ? Math.min(Math.floor(frameCount), remainingFrames) : 0;
+}
+
+function predictNextPoint(samples, fallback) {
+  if (samples.length < 2) return fallback;
+  const last = samples[samples.length - 1];
+  const previous = samples[samples.length - 2];
+  return {
+    x: clamp(last.x + (last.x - previous.x), 0, 1),
+    y: clamp(last.y + (last.y - previous.y), 0, 1),
+  };
+}
+
+function dynamicSearchRadius(samples, imageData, baseRadius) {
+  if (samples.length < 2) return baseRadius;
+  const last = samples[samples.length - 1];
+  const previous = samples[samples.length - 2];
+  const dx = (last.x - previous.x) * imageData.width;
+  const dy = (last.y - previous.y) * imageData.height;
+  const velocityPx = Math.hypot(dx, dy);
+  return clamp(Math.round(baseRadius + velocityPx * 2.2), 28, 130);
+}
+
+function smoothTrackSamples(track) {
+  if (track.samples.length < 5) return;
+  const raw = track.samples.map((sample) => ({
+    x: sample.x,
+    y: sample.y,
+    confidence: sample.confidence ?? 1,
+  }));
+
+  for (let index = 0; index < track.samples.length; index++) {
+    const start = Math.max(0, index - 2);
+    const end = Math.min(track.samples.length - 1, index + 2);
+    let sumX = 0;
+    let sumY = 0;
+    let sumWeight = 0;
+
+    for (let i = start; i <= end; i++) {
+      const kernel = 3 - Math.abs(index - i);
+      const confidence = Math.max(raw[i].confidence, 0.15);
+      const weight = kernel * confidence;
+      sumX += raw[i].x * weight;
+      sumY += raw[i].y * weight;
+      sumWeight += weight;
+    }
+
+    track.samples[index].xRaw = Number(raw[index].x.toFixed(6));
+    track.samples[index].yRaw = Number(raw[index].y.toFixed(6));
+    track.samples[index].x = Number((sumX / sumWeight).toFixed(6));
+    track.samples[index].y = Number((sumY / sumWeight).toFixed(6));
+  }
+}
+
 async function trackSelectedMarkerForward(player = activePlayer()) {
   hideContextMenu();
   if (!player) return;
@@ -589,21 +750,28 @@ async function trackSelectedMarkerForward(player = activePlayer()) {
     return;
   }
 
-  const frameCount = Number(window.prompt("앞으로 몇 프레임 추적할까요?", "60"));
-  if (!Number.isFinite(frameCount) || frameCount <= 0) return;
-
   setPlaying(false);
   const fps = player.fps ?? DEFAULT_FPS;
   const startAnalysisTime = marker.analysisTime;
   const maxAnalysisTime = analysisDuration();
-  const halfSize = 8;
-  const searchRadius = 36;
+  const remainingFrames = Math.max(0, Math.floor((maxAnalysisTime - startAnalysisTime) * fps));
+  const frameCount = parseTrackingFrameCount(
+    window.prompt("앞으로 몇 프레임 추적할까요? 빈칸/all=끝까지", String(Math.min(remainingFrames, 300))) ?? "",
+    remainingFrames,
+  );
+  if (!frameCount) return;
+
+  const halfSize = 9;
+  const baseSearchRadius = 44;
+  const updateThreshold = 0.68;
+  const recoveryThreshold = 0.46;
   let point = { ...marker.points[0] };
 
   await seekVideoTo(player, sourceTimeFor(player, startAnalysisTime));
   let imageData = captureVideoFrame(player);
-  let template = imageData ? extractTemplate(imageData, point, halfSize) : null;
-  if (!template) {
+  const initialTemplate = imageData ? extractTemplate(imageData, point, halfSize) : null;
+  let adaptiveTemplate = initialTemplate;
+  if (!initialTemplate) {
     window.alert("마커가 영상 가장자리와 너무 가깝습니다. 조금 안쪽에 마커를 놓고 다시 시도하세요.");
     return;
   }
@@ -614,22 +782,41 @@ async function trackSelectedMarkerForward(player = activePlayer()) {
     sourceAnnotationId: marker.id,
     label: `track-${state.tracks.length + 1}`,
     type: "marker",
+    algorithm: "hybrid-zncc-color-predictive-v1",
     analysisStart: Number(startAnalysisTime.toFixed(6)),
     fps,
     templateSize: halfSize * 2 + 1,
-    searchRadius,
+    baseSearchRadius,
+    updateThreshold,
+    recoveryThreshold,
     samples: [],
   };
 
+  els.playPause.textContent = "…";
   for (let frame = 0; frame <= frameCount; frame++) {
     const analysisTime = startAnalysisTime + frame / fps;
     if (analysisTime > maxAnalysisTime) break;
+    if (frame % 10 === 0) {
+      els.timeReadout.textContent = `tracking ${frame}/${frameCount}`;
+    }
     await seekVideoTo(player, sourceTimeFor(player, analysisTime));
     imageData = captureVideoFrame(player);
     if (!imageData) break;
 
     if (frame > 0) {
-      const match = matchTemplate(imageData, template, point, searchRadius);
+      const predicted = predictNextPoint(track.samples, point);
+      const searchRadius = dynamicSearchRadius(track.samples, imageData, baseSearchRadius);
+      let match = searchTemplates(imageData, [adaptiveTemplate, initialTemplate], predicted, searchRadius, searchRadius > 80 ? 4 : 3);
+      let recovered = false;
+
+      if (match.confidence < recoveryThreshold) {
+        const recovery = searchTemplates(imageData, [initialTemplate], point, Math.min(searchRadius * 2, 150), 5);
+        if (recovery.confidence > match.confidence) {
+          match = recovery;
+          recovered = true;
+        }
+      }
+
       point = match.point;
       track.samples.push({
         analysisTime: Number(analysisTime.toFixed(6)),
@@ -637,6 +824,10 @@ async function trackSelectedMarkerForward(player = activePlayer()) {
         x: Number(point.x.toFixed(6)),
         y: Number(point.y.toFixed(6)),
         confidence: Number(match.confidence.toFixed(4)),
+        predictedX: Number(predicted.x.toFixed(6)),
+        predictedY: Number(predicted.y.toFixed(6)),
+        searchRadius,
+        recovered,
       });
     } else {
       track.samples.push({
@@ -645,18 +836,30 @@ async function trackSelectedMarkerForward(player = activePlayer()) {
         x: Number(point.x.toFixed(6)),
         y: Number(point.y.toFixed(6)),
         confidence: 1,
+        predictedX: Number(point.x.toFixed(6)),
+        predictedY: Number(point.y.toFixed(6)),
+        searchRadius: baseSearchRadius,
+        recovered: false,
       });
     }
 
     const nextTemplate = extractTemplate(imageData, point, halfSize);
-    if (nextTemplate) template = nextTemplate;
+    const lastSample = track.samples[track.samples.length - 1];
+    if (nextTemplate && lastSample.confidence >= updateThreshold) {
+      adaptiveTemplate = nextTemplate;
+    }
   }
 
+  smoothTrackSamples(track);
   enrichTrackKinematics(track, player);
   state.tracks.push(track);
   state.selectedAnnotationId = marker.id;
   updateExports();
   seekAll(startAnalysisTime);
+  els.playPause.textContent = "▶";
+  window.alert(`${track.samples.length}개 프레임을 추적했습니다. 평균 confidence: ${(
+    track.samples.reduce((sum, sample) => sum + (sample.confidence ?? 0), 0) / Math.max(track.samples.length, 1)
+  ).toFixed(3)}`);
 }
 
 function playerCard(player) {
@@ -1139,9 +1342,13 @@ function csvRows() {
       const metricPairs = [
         ["confidence", sample.confidence],
         ["speedPxPerSec", sample.speedPxPerSec],
+        ["searchRadius", sample.searchRadius],
+        ["recovered", sample.recovered],
       ];
       if (sample.speedRealPerSec !== undefined) metricPairs.push(["speedRealPerSec", sample.speedRealPerSec]);
       if (sample.unit) metricPairs.push(["unit", sample.unit]);
+      if (sample.xRaw !== undefined) metricPairs.push(["xRaw", sample.xRaw]);
+      if (sample.yRaw !== undefined) metricPairs.push(["yRaw", sample.yRaw]);
       rows.push([
         track.id,
         track.playerId,
