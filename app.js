@@ -3,8 +3,10 @@ const state = {
   analysisTime: 0,
   playing: false,
   activePlayerId: null,
+  selectedAnnotationId: null,
   selectedTool: "select",
   currentDraft: null,
+  interaction: null,
   players: [],
   annotations: [],
   tracks: [],
@@ -104,6 +106,7 @@ function updateActivePlayerUI() {
 function setTool(tool) {
   state.selectedTool = tool;
   state.currentDraft = null;
+  state.interaction = null;
   updateToolUI();
   drawAllOverlays();
 }
@@ -171,6 +174,33 @@ function distancePixels(a, b, player) {
   return Math.hypot(db.x - da.x, db.y - da.y);
 }
 
+function canvasDistance(a, b, player) {
+  const da = denormalize(a, player);
+  const db = denormalize(b, player);
+  return Math.hypot(db.x - da.x, db.y - da.y);
+}
+
+function distanceToSegment(point, a, b, player) {
+  const p = denormalize(point, player);
+  const pa = denormalize(a, player);
+  const pb = denormalize(b, player);
+  const dx = pb.x - pa.x;
+  const dy = pb.y - pa.y;
+  const lengthSq = dx * dx + dy * dy;
+  if (lengthSq < EPSILON) return Math.hypot(p.x - pa.x, p.y - pa.y);
+  const t = clamp(((p.x - pa.x) * dx + (p.y - pa.y) * dy) / lengthSq, 0, 1);
+  const x = pa.x + t * dx;
+  const y = pa.y + t * dy;
+  return Math.hypot(p.x - x, p.y - y);
+}
+
+function midpoint(a, b) {
+  return {
+    x: (a.x + b.x) / 2,
+    y: (a.y + b.y) / 2,
+  };
+}
+
 function angleDegrees(a, b, c, player) {
   const pa = sourcePixelPoint(a, player);
   const pb = sourcePixelPoint(b, player);
@@ -206,6 +236,7 @@ function createAnnotation(player, type, points) {
   state.annotations.push(annotation);
   updateExports();
   drawAllOverlays();
+  return annotation;
 }
 
 function measurementMetrics(player, type, points) {
@@ -222,6 +253,72 @@ function measurementMetrics(player, type, points) {
   }
 
   return {};
+}
+
+function updateAnnotationMetrics(annotation, player = playerById(annotation.playerId)) {
+  if (!annotation || !player) return;
+  annotation.metrics = measurementMetrics(player, annotation.type, annotation.points);
+  annotation.sourceTime = Number(sourceTimeFor(player, annotation.analysisTime).toFixed(6));
+}
+
+function createDefaultAnglePoints(center) {
+  return [
+    { x: clamp(center.x - 0.12, 0, 1), y: clamp(center.y + 0.08, 0, 1) },
+    center,
+    { x: clamp(center.x + 0.12, 0, 1), y: clamp(center.y + 0.08, 0, 1) },
+  ];
+}
+
+function moveAnnotation(annotation, delta) {
+  const minX = Math.min(...annotation.points.map((point) => point.x));
+  const maxX = Math.max(...annotation.points.map((point) => point.x));
+  const minY = Math.min(...annotation.points.map((point) => point.y));
+  const maxY = Math.max(...annotation.points.map((point) => point.y));
+  const dx = clamp(delta.x, -minX, 1 - maxX);
+  const dy = clamp(delta.y, -minY, 1 - maxY);
+  annotation.points = annotation.points.map((point) => ({
+    x: point.x + dx,
+    y: point.y + dy,
+  }));
+}
+
+function annotationById(annotationId) {
+  return state.annotations.find((annotation) => annotation.id === annotationId);
+}
+
+function hitTestAnnotation(player, point) {
+  const hitRadius = 14 * (window.devicePixelRatio || 1);
+  const bodyRadius = 10 * (window.devicePixelRatio || 1);
+  const annotations = annotationsForFrame(player.id).slice().reverse();
+
+  for (const annotation of annotations) {
+    for (let index = 0; index < annotation.points.length; index++) {
+      if (canvasDistance(point, annotation.points[index], player) <= hitRadius) {
+        return { annotation, mode: "point", pointIndex: index };
+      }
+    }
+
+    if (annotation.type === "line" && annotation.points.length >= 2) {
+      if (distanceToSegment(point, annotation.points[0], annotation.points[1], player) <= bodyRadius) {
+        return { annotation, mode: "body" };
+      }
+    }
+
+    if (annotation.type === "angle" && annotation.points.length >= 3) {
+      const [a, b, c] = annotation.points;
+      const nearArm = distanceToSegment(point, a, b, player) <= bodyRadius || distanceToSegment(point, b, c, player) <= bodyRadius;
+      const nearCenter = canvasDistance(point, b, player) <= hitRadius * 1.5;
+      if (nearArm || nearCenter) return { annotation, mode: "body" };
+    }
+
+    if (annotation.type === "marker" && annotation.points.length) {
+      if (canvasDistance(point, annotation.points[0], player) <= hitRadius) {
+        return { annotation, mode: "point", pointIndex: 0 };
+      }
+    }
+  }
+
+  return null;
 }
 
 function playerCard(player) {
@@ -269,7 +366,10 @@ function renderPlayers() {
 
     card.querySelector('[data-action="activate"]').addEventListener("click", () => setActivePlayer(player.id));
     card.addEventListener("pointerdown", () => setActivePlayer(player.id));
-    canvas.addEventListener("pointerdown", (event) => handleCanvasClick(event, player));
+    canvas.addEventListener("pointerdown", (event) => handleCanvasPointerDown(event, player));
+    canvas.addEventListener("pointermove", (event) => handleCanvasPointerMove(event, player));
+    canvas.addEventListener("pointerup", (event) => finishCanvasInteraction(event, player));
+    canvas.addEventListener("pointercancel", (event) => finishCanvasInteraction(event, player));
 
     card.querySelectorAll("[data-field]").forEach((input) => {
       input.addEventListener("change", () => {
@@ -310,29 +410,112 @@ function resizeCanvas(player) {
   player.canvas.height = Math.max(1, Math.floor(rect.height * scale));
 }
 
-function handleCanvasClick(event, player) {
+function handleCanvasPointerDown(event, player) {
   event.stopPropagation();
-  if (state.selectedTool === "select") return;
+  event.preventDefault();
   setActivePlayer(player.id);
   const point = normalizedPoint(event, player);
-  const requiredPoints = state.selectedTool === "angle" ? 3 : state.selectedTool === "marker" ? 1 : 2;
+  player.canvas.setPointerCapture?.(event.pointerId);
+  const hit = hitTestAnnotation(player, point);
 
-  if (!state.currentDraft || state.currentDraft.playerId !== player.id || state.currentDraft.type !== state.selectedTool) {
-    state.currentDraft = {
+  if (hit && (state.selectedTool === "select" || hit.annotation.type === state.selectedTool || hit.mode === "point")) {
+    state.selectedAnnotationId = hit.annotation.id;
+    state.interaction = {
+      type: hit.mode === "point" ? "drag-point" : "drag-body",
       playerId: player.id,
-      type: state.selectedTool,
-      points: [],
+      annotationId: hit.annotation.id,
+      pointIndex: hit.pointIndex,
+      lastPoint: point,
+      pointerId: event.pointerId,
     };
-  }
-
-  state.currentDraft.points.push(point);
-
-  if (state.currentDraft.points.length >= requiredPoints) {
-    createAnnotation(player, state.currentDraft.type, state.currentDraft.points);
-    state.currentDraft = null;
-  } else {
     drawAllOverlays();
+    return;
   }
+
+  if (state.selectedTool === "select") {
+    state.selectedAnnotationId = null;
+    drawAllOverlays();
+    return;
+  }
+
+  if (state.selectedTool === "line") {
+    const annotation = createAnnotation(player, "line", [point, point]);
+    state.selectedAnnotationId = annotation.id;
+    state.interaction = {
+      type: "drag-point",
+      playerId: player.id,
+      annotationId: annotation.id,
+      pointIndex: 1,
+      pointerId: event.pointerId,
+    };
+    drawAllOverlays();
+    return;
+  }
+
+  if (state.selectedTool === "angle") {
+    const annotation = createAnnotation(player, "angle", createDefaultAnglePoints(point));
+    state.selectedAnnotationId = annotation.id;
+    state.interaction = {
+      type: "drag-body",
+      playerId: player.id,
+      annotationId: annotation.id,
+      lastPoint: point,
+      pointerId: event.pointerId,
+    };
+    drawAllOverlays();
+    return;
+  }
+
+  if (state.selectedTool === "marker") {
+    const annotation = createAnnotation(player, "marker", [point]);
+    state.selectedAnnotationId = annotation.id;
+    state.interaction = {
+      type: "drag-point",
+      playerId: player.id,
+      annotationId: annotation.id,
+      pointIndex: 0,
+      pointerId: event.pointerId,
+    };
+    drawAllOverlays();
+    return;
+  }
+}
+
+function handleCanvasPointerMove(event, player) {
+  if (!state.interaction || state.interaction.playerId !== player.id) return;
+  if (state.interaction.pointerId !== event.pointerId) return;
+  event.preventDefault();
+  const annotation = annotationById(state.interaction.annotationId);
+  if (!annotation) return;
+  const point = normalizedPoint(event, player);
+
+  if (state.interaction.type === "drag-point") {
+    annotation.points[state.interaction.pointIndex] = point;
+  }
+
+  if (state.interaction.type === "drag-body") {
+    const lastPoint = state.interaction.lastPoint ?? point;
+    moveAnnotation(annotation, {
+      x: point.x - lastPoint.x,
+      y: point.y - lastPoint.y,
+    });
+    state.interaction.lastPoint = point;
+  }
+
+  updateAnnotationMetrics(annotation, player);
+  updateExports();
+  drawAllOverlays();
+}
+
+function finishCanvasInteraction(event, player) {
+  if (!state.interaction || state.interaction.playerId !== player.id) return;
+  if (state.interaction.pointerId !== event.pointerId) return;
+  const annotation = annotationById(state.interaction.annotationId);
+  if (annotation) updateAnnotationMetrics(annotation, player);
+  state.interaction = null;
+  player.canvas.releasePointerCapture?.(event.pointerId);
+  updateExports();
+  drawAllOverlays();
 }
 
 async function addFiles(files) {
@@ -384,7 +567,7 @@ function setPlaying(playing) {
   if (!state.players.length) return;
   state.playing = playing;
   state.lastTick = performance.now();
-  els.playPause.textContent = playing ? "정지" : "재생";
+  els.playPause.textContent = playing ? "⏸" : "▶";
   if (playing) {
     state.players.forEach((player) => syncVideoElement(player, true));
     requestAnimationFrame(tick);
@@ -447,12 +630,13 @@ function drawOverlay(player) {
   }
 }
 
-function drawPoint(ctx, point, player, color = "#f8d45c") {
+function drawPoint(ctx, point, player, color = "#f8d45c", selected = false) {
   const p = denormalize(point, player);
   ctx.fillStyle = color;
   ctx.strokeStyle = "#111";
+  ctx.lineWidth = selected ? 3 * (window.devicePixelRatio || 1) : 2 * (window.devicePixelRatio || 1);
   ctx.beginPath();
-  ctx.arc(p.x, p.y, 6 * (window.devicePixelRatio || 1), 0, Math.PI * 2);
+  ctx.arc(p.x, p.y, (selected ? 7 : 6) * (window.devicePixelRatio || 1), 0, Math.PI * 2);
   ctx.fill();
   ctx.stroke();
 }
@@ -475,20 +659,53 @@ function drawLabel(ctx, text, point, player) {
   ctx.fillText(text, p.x + 14, p.y - 7);
 }
 
+function drawAngleArc(ctx, player, annotation, color) {
+  const [a, b, c] = annotation.points;
+  const pa = denormalize(a, player);
+  const pb = denormalize(b, player);
+  const pc = denormalize(c, player);
+  const radius = Math.max(
+    22 * (window.devicePixelRatio || 1),
+    Math.min(
+      56 * (window.devicePixelRatio || 1),
+      canvasDistance(a, b, player) * 0.32,
+      canvasDistance(c, b, player) * 0.32,
+    ),
+  );
+  const start = Math.atan2(pa.y - pb.y, pa.x - pb.x);
+  const end = Math.atan2(pc.y - pb.y, pc.x - pb.x);
+  let delta = end - start;
+  while (delta > Math.PI) delta -= Math.PI * 2;
+  while (delta < -Math.PI) delta += Math.PI * 2;
+
+  ctx.strokeStyle = color;
+  ctx.beginPath();
+  ctx.arc(pb.x, pb.y, radius, start, start + delta, delta < 0);
+  ctx.stroke();
+
+  const mid = start + delta / 2;
+  const labelPoint = {
+    x: (pb.x + Math.cos(mid) * (radius + 18 * (window.devicePixelRatio || 1)) - videoContentRect(player, true).x) / videoContentRect(player, true).width,
+    y: (pb.y + Math.sin(mid) * (radius + 18 * (window.devicePixelRatio || 1)) - videoContentRect(player, true).y) / videoContentRect(player, true).height,
+  };
+  drawLabel(ctx, `${angleDegrees(a, b, c, player).toFixed(1)}°`, labelPoint, player);
+}
+
 function drawAnnotation(ctx, player, annotation, isDraft = false) {
-  const color = isDraft ? "#f8d45c" : "#4ee0b5";
-  annotation.points.forEach((point) => drawPoint(ctx, point, player, color));
+  const selected = annotation.id === state.selectedAnnotationId;
+  const color = isDraft ? "#f8d45c" : selected ? "#f8d45c" : "#4ee0b5";
+  annotation.points.forEach((point) => drawPoint(ctx, point, player, color, selected));
 
   if (annotation.type === "line" && annotation.points.length >= 2) {
     drawLine(ctx, annotation.points[0], annotation.points[1], player, color);
-    drawLabel(ctx, `${Math.round(distancePixels(annotation.points[0], annotation.points[1], player))} px`, annotation.points[1], player);
+    drawLabel(ctx, `${Math.round(distancePixels(annotation.points[0], annotation.points[1], player))} px`, midpoint(annotation.points[0], annotation.points[1]), player);
   }
 
   if (annotation.type === "angle") {
     if (annotation.points.length >= 2) drawLine(ctx, annotation.points[0], annotation.points[1], player, color);
     if (annotation.points.length >= 3) {
       drawLine(ctx, annotation.points[1], annotation.points[2], player, color);
-      drawLabel(ctx, `${angleDegrees(annotation.points[0], annotation.points[1], annotation.points[2], player).toFixed(1)}°`, annotation.points[1], player);
+      drawAngleArc(ctx, player, annotation, color);
     }
   }
 

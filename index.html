@@ -45,9 +45,9 @@
     </main>
 
     <footer class="transport">
-      <button id="stepBack">-1 frame</button>
-      <button id="playPause" class="primary">재생</button>
-      <button id="stepForward">+1 frame</button>
+      <button id="stepBack" class="transport-icon" title="-1 frame" aria-label="-1 frame">‹<span>1f</span></button>
+      <button id="playPause" class="primary transport-play" title="play/pause" aria-label="play/pause">▶</button>
+      <button id="stepForward" class="transport-icon" title="+1 frame" aria-label="+1 frame"><span>1f</span>›</button>
       <input id="timeline" type="range" min="0" max="0" step="0.001" value="0">
       <output id="timeReadout">00:00.000 / 00:00.000</output>
     </footer>
