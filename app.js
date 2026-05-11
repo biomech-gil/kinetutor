@@ -13,6 +13,7 @@ const state = {
   annotations: [],
   tracks: [],
   lastTick: 0,
+  rafId: null,
 };
 
 const els = {
@@ -81,7 +82,7 @@ function syncVideoElement(player, shouldPlay = false) {
   if (!player.video) return;
   const target = sourceTimeFor(player);
   const tolerance = shouldPlay ? 0.09 : 0.015;
-  if (Math.abs(player.video.currentTime - target) > tolerance) {
+  if (shouldPlay && Math.abs(player.video.currentTime - target) > tolerance) {
     player.video.currentTime = target;
   }
 
@@ -90,6 +91,12 @@ function syncVideoElement(player, shouldPlay = false) {
   } else {
     player.video.pause();
   }
+}
+
+function pauseAllVideos() {
+  state.players.forEach((player) => {
+    player.video?.pause();
+  });
 }
 
 function playerById(playerId) {
@@ -350,6 +357,21 @@ function moveAnnotation(annotation, delta) {
   }));
 }
 
+function syncLinkedMarkerRoi(annotation) {
+  if (annotation.type !== "trackbox" || !annotation.linkedMarkerId) return;
+  const marker = annotationById(annotation.linkedMarkerId);
+  if (!marker?.trackingRoi || marker.trackingRoi.trackboxId !== annotation.id) return;
+  marker.trackingRoi.points = annotation.points.map((point) => ({ ...point }));
+}
+
+function moveLinkedRoiWithMarker(annotation, delta) {
+  if (annotation.type !== "marker" || !annotation.trackingRoi?.trackboxId) return;
+  const box = annotationById(annotation.trackingRoi.trackboxId);
+  if (!box) return;
+  moveAnnotation(box, delta);
+  annotation.trackingRoi.points = box.points.map((point) => ({ ...point }));
+}
+
 function annotationById(annotationId) {
   return state.annotations.find((annotation) => annotation.id === annotationId);
 }
@@ -389,8 +411,8 @@ function hitTestAnnotation(player, point) {
     }
 
     if (annotation.type === "marker" && annotation.points.length) {
-      if (canvasDistance(point, annotation.points[0], player) <= hitRadius) {
-        return { annotation, mode: "point", pointIndex: 0 };
+      if (canvasDistance(point, annotation.points[0], player) <= hitRadius * 1.8) {
+        return { annotation, mode: "body" };
       }
     }
   }
@@ -1488,7 +1510,15 @@ function handleCanvasPointerMove(event, player) {
   const point = normalizedPoint(event, player);
 
   if (state.interaction.type === "drag-point") {
+    const previousPoint = annotation.points[state.interaction.pointIndex];
     annotation.points[state.interaction.pointIndex] = point;
+    if (annotation.type === "marker") {
+      moveLinkedRoiWithMarker(annotation, {
+        x: point.x - previousPoint.x,
+        y: point.y - previousPoint.y,
+      });
+    }
+    syncLinkedMarkerRoi(annotation);
   }
 
   if (state.interaction.type === "drag-body") {
@@ -1497,7 +1527,12 @@ function handleCanvasPointerMove(event, player) {
       x: point.x - lastPoint.x,
       y: point.y - lastPoint.y,
     });
+    moveLinkedRoiWithMarker(annotation, {
+      x: point.x - lastPoint.x,
+      y: point.y - lastPoint.y,
+    });
     state.interaction.lastPoint = point;
+    syncLinkedMarkerRoi(annotation);
   }
 
   updateAnnotationMetrics(annotation, player);
@@ -1511,6 +1546,7 @@ function finishCanvasInteraction(event, player) {
   const annotation = annotationById(state.interaction.annotationId);
   if (annotation) {
     updateAnnotationMetrics(annotation, player);
+    syncLinkedMarkerRoi(annotation);
     if (annotation.type === "trackbox") {
       const rect = rectFromPoints(annotation.points[0], annotation.points[1]);
       if (rect.width < 0.01 || rect.height < 0.01) {
@@ -1593,16 +1629,25 @@ function setPlaying(playing) {
   state.playing = playing;
   state.lastTick = performance.now();
   els.playPause.textContent = playing ? "⏸" : "▶";
+  if (state.rafId) {
+    cancelAnimationFrame(state.rafId);
+    state.rafId = null;
+  }
   if (playing) {
     state.players.forEach((player) => syncVideoElement(player, true));
-    requestAnimationFrame(tick);
+    state.rafId = requestAnimationFrame(tick);
   } else {
-    state.players.forEach((player) => syncVideoElement(player, false));
+    pauseAllVideos();
+    updateTimeline();
+    drawAllOverlays();
   }
 }
 
 function tick(now) {
-  if (!state.playing) return;
+  if (!state.playing) {
+    state.rafId = null;
+    return;
+  }
   const delta = (now - state.lastTick) / 1000;
   state.lastTick = now;
   const next = state.analysisTime + delta;
@@ -1615,7 +1660,7 @@ function tick(now) {
   state.players.forEach((player) => syncVideoElement(player, true));
   updateTimeline();
   drawAllOverlays();
-  requestAnimationFrame(tick);
+  state.rafId = requestAnimationFrame(tick);
 }
 
 function stepFrame(direction) {
