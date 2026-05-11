@@ -454,7 +454,11 @@ function markerForTracking(player) {
   if (selected?.playerId === player.id && selected.type === "marker") return selected;
 
   const markers = annotationsForFrame(player.id).filter((annotation) => annotation.type === "marker");
-  return markers.at(-1) ?? null;
+  if (markers.length) return markers.at(-1);
+
+  return state.annotations
+    .filter((annotation) => annotation.playerId === player.id && annotation.type === "marker")
+    .sort((a, b) => Math.abs(a.analysisTime - state.analysisTime) - Math.abs(b.analysisTime - state.analysisTime))[0] ?? null;
 }
 
 function seekVideoTo(player, sourceTime) {
@@ -506,6 +510,103 @@ function rgbAt(imageData, x, y) {
     r: data[index],
     g: data[index + 1],
     b: data[index + 2],
+  };
+}
+
+function rgbDistance(a, b) {
+  return Math.hypot(a.r - b.r, a.g - b.g, a.b - b.b);
+}
+
+function averageRgb(points) {
+  if (!points.length) return { r: 0, g: 0, b: 0 };
+  return {
+    r: points.reduce((sum, point) => sum + point.r, 0) / points.length,
+    g: points.reduce((sum, point) => sum + point.g, 0) / points.length,
+    b: points.reduce((sum, point) => sum + point.b, 0) / points.length,
+  };
+}
+
+function extractColorModel(imageData, point, innerRadius = 10, outerRadius = 28) {
+  const centerX = Math.round(point.x * imageData.width);
+  const centerY = Math.round(point.y * imageData.height);
+  const foreground = [];
+  const background = [];
+
+  for (let y = centerY - outerRadius; y <= centerY + outerRadius; y++) {
+    if (y < 0 || y >= imageData.height) continue;
+    for (let x = centerX - outerRadius; x <= centerX + outerRadius; x++) {
+      if (x < 0 || x >= imageData.width) continue;
+      const distance = Math.hypot(x - centerX, y - centerY);
+      if (distance <= innerRadius) foreground.push(rgbAt(imageData, x, y));
+      else if (distance >= outerRadius * 0.68 && distance <= outerRadius) background.push(rgbAt(imageData, x, y));
+    }
+  }
+
+  const fgMean = averageRgb(foreground);
+  const bgMean = averageRgb(background);
+  return {
+    fgMean,
+    bgMean,
+    separation: rgbDistance(fgMean, bgMean),
+    innerRadius,
+    outerRadius,
+    expectedArea: Math.PI * innerRadius * innerRadius,
+  };
+}
+
+function objectPixelScore(rgb, model) {
+  const foregroundDistance = rgbDistance(rgb, model.fgMean);
+  const backgroundDistance = rgbDistance(rgb, model.bgMean);
+  const separation = Math.max(model.separation, 12);
+  const absoluteScore = clamp(1 - foregroundDistance / Math.max(55, separation * 1.8), 0, 1);
+  const relativeScore = clamp((backgroundDistance - foregroundDistance + separation) / (2 * separation), 0, 1);
+  return 0.42 * absoluteScore + 0.58 * relativeScore;
+}
+
+function trackColorBlob(imageData, model, centerPoint, searchRadius) {
+  const centerX = Math.round(centerPoint.x * imageData.width);
+  const centerY = Math.round(centerPoint.y * imageData.height);
+  const minX = Math.max(0, centerX - searchRadius);
+  const maxX = Math.min(imageData.width - 1, centerX + searchRadius);
+  const minY = Math.max(0, centerY - searchRadius);
+  const maxY = Math.min(imageData.height - 1, centerY + searchRadius);
+  const step = searchRadius > 95 ? 2 : 1;
+  const sigma = Math.max(searchRadius * 0.62, 1);
+  let weightSum = 0;
+  let xSum = 0;
+  let ySum = 0;
+  let accepted = 0;
+  let scoreSum = 0;
+
+  for (let y = minY; y <= maxY; y += step) {
+    for (let x = minX; x <= maxX; x += step) {
+      const distance = Math.hypot(x - centerX, y - centerY);
+      if (distance > searchRadius) continue;
+      const score = objectPixelScore(rgbAt(imageData, x, y), model);
+      if (score < 0.48) continue;
+      const proximity = Math.exp(-(distance * distance) / (2 * sigma * sigma));
+      const weight = score * score * (0.35 + 0.65 * proximity);
+      weightSum += weight;
+      xSum += x * weight;
+      ySum += y * weight;
+      accepted += step * step;
+      scoreSum += score;
+    }
+  }
+
+  if (weightSum <= EPSILON || accepted < Math.max(8, model.expectedArea * 0.08)) {
+    return { point: centerPoint, confidence: 0, accepted };
+  }
+
+  const areaConfidence = clamp(accepted / Math.max(model.expectedArea * 0.32, 1), 0, 1);
+  const meanScore = scoreSum / Math.max(accepted / (step * step), 1);
+  return {
+    point: {
+      x: clamp((xSum / weightSum) / imageData.width, 0, 1),
+      y: clamp((ySum / weightSum) / imageData.height, 0, 1),
+    },
+    confidence: Number(clamp(meanScore * (0.45 + 0.55 * areaConfidence), 0, 1).toFixed(4)),
+    accepted,
   };
 }
 
@@ -710,6 +811,56 @@ function dynamicSearchRadius(samples, imageData, baseRadius) {
   return clamp(Math.round(baseRadius + velocityPx * 2.2), 28, 130);
 }
 
+function combineTrackingCandidates(templateMatch, blobMatch, predicted) {
+  if (!blobMatch || blobMatch.confidence <= 0.05) {
+    return {
+      point: templateMatch.point,
+      confidence: templateMatch.confidence,
+      mode: "template",
+      templateConfidence: templateMatch.confidence,
+      blobConfidence: blobMatch?.confidence ?? 0,
+    };
+  }
+
+  const templateWeight = Math.max(templateMatch.confidence - 0.30, 0) * 1.05;
+  const blobWeight = Math.max(blobMatch.confidence - 0.22, 0) * 1.45;
+  if (blobMatch.confidence >= 0.62 && templateMatch.confidence < 0.55) {
+    return {
+      point: blobMatch.point,
+      confidence: blobMatch.confidence,
+      mode: "blob",
+      templateConfidence: templateMatch.confidence,
+      blobConfidence: blobMatch.confidence,
+    };
+  }
+
+  if (templateWeight + blobWeight <= EPSILON) {
+    return {
+      point: predicted,
+      confidence: 0,
+      mode: "predicted",
+      templateConfidence: templateMatch.confidence,
+      blobConfidence: blobMatch.confidence,
+    };
+  }
+
+  return {
+    point: {
+      x: clamp((templateMatch.point.x * templateWeight + blobMatch.point.x * blobWeight) / (templateWeight + blobWeight), 0, 1),
+      y: clamp((templateMatch.point.y * templateWeight + blobMatch.point.y * blobWeight) / (templateWeight + blobWeight), 0, 1),
+    },
+    confidence: Number(Math.max(templateMatch.confidence, blobMatch.confidence).toFixed(4)),
+    mode: blobWeight > templateWeight ? "hybrid-blob" : "hybrid-template",
+    templateConfidence: templateMatch.confidence,
+    blobConfidence: blobMatch.confidence,
+  };
+}
+
+function trackDisplacementPx(track, player) {
+  if (track.samples.length < 2) return 0;
+  return distancePixels(track.samples[0], track.samples.at(-1), player);
+}
+
 function smoothTrackSamples(track) {
   if (track.samples.length < 5) return;
   const raw = track.samples.map((sample) => ({
@@ -770,8 +921,9 @@ async function trackSelectedMarkerForward(player = activePlayer()) {
   await seekVideoTo(player, sourceTimeFor(player, startAnalysisTime));
   let imageData = captureVideoFrame(player);
   const initialTemplate = imageData ? extractTemplate(imageData, point, halfSize) : null;
+  const colorModel = imageData ? extractColorModel(imageData, point, Math.max(10, halfSize), 32) : null;
   let adaptiveTemplate = initialTemplate;
-  if (!initialTemplate) {
+  if (!initialTemplate || !colorModel) {
     window.alert("마커가 영상 가장자리와 너무 가깝습니다. 조금 안쪽에 마커를 놓고 다시 시도하세요.");
     return;
   }
@@ -782,13 +934,18 @@ async function trackSelectedMarkerForward(player = activePlayer()) {
     sourceAnnotationId: marker.id,
     label: `track-${state.tracks.length + 1}`,
     type: "marker",
-    algorithm: "hybrid-zncc-color-predictive-v1",
+    algorithm: "hybrid-zncc-color-blob-predictive-v2",
     analysisStart: Number(startAnalysisTime.toFixed(6)),
     fps,
     templateSize: halfSize * 2 + 1,
     baseSearchRadius,
     updateThreshold,
     recoveryThreshold,
+    colorModel: {
+      fgMean: colorModel.fgMean,
+      bgMean: colorModel.bgMean,
+      separation: Number(colorModel.separation.toFixed(3)),
+    },
     samples: [],
   };
 
@@ -807,6 +964,7 @@ async function trackSelectedMarkerForward(player = activePlayer()) {
       const predicted = predictNextPoint(track.samples, point);
       const searchRadius = dynamicSearchRadius(track.samples, imageData, baseSearchRadius);
       let match = searchTemplates(imageData, [adaptiveTemplate, initialTemplate], predicted, searchRadius, searchRadius > 80 ? 4 : 3);
+      let blobMatch = trackColorBlob(imageData, colorModel, predicted, searchRadius);
       let recovered = false;
 
       if (match.confidence < recoveryThreshold) {
@@ -815,18 +973,27 @@ async function trackSelectedMarkerForward(player = activePlayer()) {
           match = recovery;
           recovered = true;
         }
+        const blobRecovery = trackColorBlob(imageData, colorModel, point, Math.min(searchRadius * 2, 150));
+        if (blobRecovery.confidence > blobMatch.confidence) {
+          blobMatch = blobRecovery;
+          recovered = true;
+        }
       }
 
-      point = match.point;
+      const combined = combineTrackingCandidates(match, blobMatch, predicted);
+      point = combined.point;
       track.samples.push({
         analysisTime: Number(analysisTime.toFixed(6)),
         sourceTime: Number(sourceTimeFor(player, analysisTime).toFixed(6)),
         x: Number(point.x.toFixed(6)),
         y: Number(point.y.toFixed(6)),
-        confidence: Number(match.confidence.toFixed(4)),
+        confidence: combined.confidence,
+        templateConfidence: Number(combined.templateConfidence.toFixed(4)),
+        blobConfidence: Number(combined.blobConfidence.toFixed(4)),
         predictedX: Number(predicted.x.toFixed(6)),
         predictedY: Number(predicted.y.toFixed(6)),
         searchRadius,
+        mode: combined.mode,
         recovered,
       });
     } else {
@@ -836,9 +1003,12 @@ async function trackSelectedMarkerForward(player = activePlayer()) {
         x: Number(point.x.toFixed(6)),
         y: Number(point.y.toFixed(6)),
         confidence: 1,
+        templateConfidence: 1,
+        blobConfidence: 1,
         predictedX: Number(point.x.toFixed(6)),
         predictedY: Number(point.y.toFixed(6)),
         searchRadius: baseSearchRadius,
+        mode: "seed",
         recovered: false,
       });
     }
@@ -852,12 +1022,17 @@ async function trackSelectedMarkerForward(player = activePlayer()) {
 
   smoothTrackSamples(track);
   enrichTrackKinematics(track, player);
+  track.displacementPx = Number(trackDisplacementPx(track, player).toFixed(3));
+  if (player.calibration?.pixelsPerUnit) {
+    track.displacementReal = Number((track.displacementPx / player.calibration.pixelsPerUnit).toFixed(4));
+    track.unit = player.calibration.unit;
+  }
   state.tracks.push(track);
   state.selectedAnnotationId = marker.id;
   updateExports();
   seekAll(startAnalysisTime);
   els.playPause.textContent = "▶";
-  window.alert(`${track.samples.length}개 프레임을 추적했습니다. 평균 confidence: ${(
+  window.alert(`${track.samples.length}개 프레임을 추적했습니다. 총 이동: ${distanceLabel(track.displacementPx, player)}, 평균 confidence: ${(
     track.samples.reduce((sum, sample) => sum + (sample.confidence ?? 0), 0) / Math.max(track.samples.length, 1)
   ).toFixed(3)}`);
 }
@@ -1184,9 +1359,20 @@ function drawTracks(ctx, player) {
   const tracks = state.tracks.filter((track) => track.playerId === player.id);
 
   tracks.forEach((track) => {
+    if (track.samples.length >= 2) {
+      ctx.strokeStyle = "rgba(248, 212, 92, 0.24)";
+      ctx.beginPath();
+      track.samples.forEach((sample, index) => {
+        const point = denormalize({ x: sample.x, y: sample.y }, player);
+        if (index === 0) ctx.moveTo(point.x, point.y);
+        else ctx.lineTo(point.x, point.y);
+      });
+      ctx.stroke();
+    }
+
     const trace = track.samples.filter((sample) => sample.analysisTime <= state.analysisTime).slice(-80);
     if (trace.length >= 2) {
-      ctx.strokeStyle = "rgba(248, 212, 92, 0.62)";
+      ctx.strokeStyle = "rgba(248, 212, 92, 0.78)";
       ctx.beginPath();
       trace.forEach((sample, index) => {
         const point = denormalize({ x: sample.x, y: sample.y }, player);
@@ -1341,9 +1527,12 @@ function csvRows() {
     track.samples.forEach((sample, index) => {
       const metricPairs = [
         ["confidence", sample.confidence],
+        ["templateConfidence", sample.templateConfidence],
+        ["blobConfidence", sample.blobConfidence],
         ["speedPxPerSec", sample.speedPxPerSec],
         ["searchRadius", sample.searchRadius],
         ["recovered", sample.recovered],
+        ["mode", sample.mode],
       ];
       if (sample.speedRealPerSec !== undefined) metricPairs.push(["speedRealPerSec", sample.speedRealPerSec]);
       if (sample.unit) metricPairs.push(["unit", sample.unit]);
