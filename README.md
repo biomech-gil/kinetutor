@@ -1,52 +1,168 @@
 # KineTutor
 
-KineTutor는 비디오 기반 각도, 거리, 마커 움직임을 교육적으로 학습하기 위한 웹 운동학 분석 MVP입니다. 현재 구현은 의존성 없는 정적 웹앱이며, 다음 단계에서 백엔드 FFmpeg 변환, AI pose import, 마커 트래킹 엔진을 붙일 수 있도록 데이터 모델을 먼저 고정했습니다.
+KineTutor is a browser-based educational kinematics tool for learning video motion analysis. It started as a pragmatic web-native alternative to a subset of Kinovea-style workflows: synchronized video playback, manual angles/distances, calibration, and marker tracking.
 
-## 실행
+The project is intentionally a dependency-free static web app for now. Open `index.html` or serve the folder with a tiny static server. This keeps iteration fast while the motion-analysis data model and interaction patterns are still being shaped.
 
-브라우저에서 `index.html`을 열거나 정적 서버로 실행합니다.
+## Background And Goal
+
+The target user is a biomechanics educator/researcher who needs a lightweight tool for teaching 2D video kinematics:
+
+- Load one or more videos.
+- Synchronize split-view playback with per-video trim and offset.
+- Draw markers, distances, angles, and tracking ROIs directly on video.
+- Calibrate a drawn segment to a real-world length such as `50 cm`.
+- Track a thrown object or marker through frames.
+- Export the project and measurements for later analysis.
+
+This is not a Kinovea fork. It is a new web implementation that borrows useful interaction ideas while keeping the architecture ready for future AI pose estimation, external pose-result import, and backend video preprocessing.
+
+## Run Locally
+
+From the repository root:
 
 ```powershell
-python -m http.server 5173
+python -m http.server 5187
 ```
 
-그 다음 `http://localhost:5173`으로 접속합니다.
+Then open:
 
-## 현재 기능
+```text
+http://127.0.0.1:5187
+```
 
-- 여러 영상 업로드
-- 1/2/4분할 스타일 플레이어
-- 공통 `analysisTime` 기반 싱크 재생
-- 플레이어별 `sourceIn`, `sourceOut`, `syncOffset`, `fps` 설정
-- 프레임 단위 이동
-- 마커, 거리, 3마커 각도 annotation
-- signed angle 및 각도 부호 반전 옵션
-- 브라우저 내 marker tracking MVP
-- 트래킹 박스 ROI 기반 tracking seed
-- 마커 우클릭 후 tracking box를 연결하는 marker+ROI workflow
-- 우클릭 컨텍스트 메뉴를 통한 개별 객체 삭제
-- 프로젝트 JSON export
-- annotation CSV export
+If the app looks stale after code changes, force reload the browser with `Ctrl + F5`.
 
-## 설계 원칙
+## Current Workflow
 
-원본 영상을 직접 자르지 않고 비파괴 trim으로 관리합니다.
+1. Upload one or more videos.
+2. Use each player’s `In`, `Out`, `Offset`, and `FPS` controls to align videos on the shared analysis timeline.
+3. Use the in-video tool buttons:
+   - `S`: select/edit
+   - `+`: marker
+   - `/`: distance line
+   - `A`: 3-point angle
+   - `□`: tracking ROI box
+   - `T`: track the selected marker/ROI forward
+4. Drag the timeline or use `‹ 1f`, `▶/⏸`, `1f ›` to inspect frame-by-frame motion.
+5. Export JSON or CSV from the left panel.
+
+## Implemented Features
+
+- Multi-video upload and split-view player grid.
+- Shared `analysisTime` timeline across all videos.
+- Per-player non-destructive trim/sync model using `sourceIn`, `sourceOut`, and `syncOffset`.
+- Frame stepping based on the active player’s `fps`.
+- Manual marker, distance, angle, and tracking ROI annotations.
+- Draggable annotation editing:
+  - Drag marker to move it.
+  - Drag distance/angle handles to edit geometry.
+  - Drag angle body or ROI box body to move the whole object.
+  - Marker-linked ROI boxes move with the marker.
+- Signed 3-point angle calculation, with right-click `Reverse angle sign`.
+- Distance calibration:
+  - Draw a distance line.
+  - Right-click it.
+  - Choose `Calibrate length...`.
+  - Enter a real-world length such as `50 cm`.
+  - Subsequent distances use that player’s `pixelsPerUnit`.
+- Right-click context menu for object-specific actions:
+  - Calibrate line length.
+  - Reverse angle sign.
+  - Attach tracking box to marker.
+  - Track forward.
+  - Delete individual marker/line/angle/ROI/track.
+- Project JSON export.
+- Measurement CSV export, including annotations and track samples.
+
+## Tracking Workflow
+
+The recommended tracking workflow is marker plus ROI:
+
+1. Use `+` to place a marker at the object center.
+2. Right-click that marker.
+3. Choose `Set tracking box...`.
+4. Drag a box around the whole object, with a small margin.
+5. Select the marker and press `T`, or right-click and choose `Track forward...`.
+6. Enter a frame count or `all`.
+7. Press play. The tracked point/box should follow frame-by-frame according to the current timeline position.
+
+The standalone `□` tracking box also works, but for objects like a shot put ball, marker plus ROI is the preferred workflow because it combines an explicit center point with the visual model inside the ROI.
+
+## Tracking Algorithm
+
+Current algorithm: `hybrid-zncc-color-blob-predictive-v2`.
+
+The tracker combines several browser-side signals:
+
+- Initial template anchor: the first template is kept to reduce drift.
+- Adaptive template: updated only on high-confidence frames.
+- Motion prediction: next search center uses previous velocity.
+- Template matching: normalized grayscale correlation with color similarity, contrast stability, and distance penalty.
+- Color blob model: foreground/background color model from the linked ROI; useful for round objects such as shot puts.
+- Recovery search: if confidence drops, the tracker expands the search around the previous point.
+- Smoothing: confidence-weighted local smoothing before velocity calculation.
+
+Track samples are stored in `tracks[].samples` with:
+
+- `analysisTime`
+- `sourceTime`
+- normalized `x`, `y`
+- `confidence`
+- `templateConfidence`
+- `blobConfidence`
+- `mode`
+- `speedPxPerSec`
+- calibrated `speedRealPerSec` when calibration exists
+
+## Data Model Notes
+
+The core timing equation is:
 
 ```text
 sourceTime = analysisTime + sourceIn + syncOffset
 ```
 
-모든 측정값은 `analysisTime` 기준으로 저장하고, 각 플레이어의 실제 원본 시간은 `sourceTime`으로 함께 저장합니다. 이 구조를 유지해야 이후 AI pose 결과, 수동 마커, 자동 트래킹 결과를 같은 타임라인에서 합칠 수 있습니다.
+All annotations and tracks are stored against `analysisTime`, while each player computes its own video `sourceTime`. This is essential for multi-view synchronization, future AI pose import, and consistent CSV export.
 
-마커 좌표는 캔버스 좌표가 아니라 실제 영상 프레임 기준 정규화 좌표입니다. 영상이 letterbox 형태로 표시되어도 검은 여백이 좌표계에 섞이지 않습니다.
+Coordinates are normalized to the actual video frame, not the canvas box. Letterboxing is excluded from the coordinate system.
 
-## 다음 확장 지점
+Important top-level state:
 
-- `tracks`: 같은 마커의 시간축 좌표 시퀀스 저장
-- `annotations`: 단일 프레임 마커/거리/각도 저장
-- `calibration`: 픽셀-실측 단위 변환 저장
-- 백엔드: 업로드 원본을 constant frame rate proxy MP4로 변환
-- AI pose: 외부 서비스 결과를 `analysisTime` 기준 joint track으로 import
-- 마커 트래킹: 초기 ROI 지정 후 frame-by-frame 좌표를 `tracks.samples`에 저장
+- `players`: uploaded video instances and per-player settings.
+- `annotations`: frame annotations such as marker, line, angle, and tracking ROI.
+- `tracks`: time-series tracking results.
+- `calibration`: per-player pixel-to-real-unit conversion.
 
-현재 트래킹은 `hybrid-zncc-color-blob-predictive-v2`입니다. 권장 방식은 먼저 마커로 중심점을 찍고, 해당 마커를 우클릭해 `Set tracking box...`로 물체 전체를 감싸는 ROI를 연결한 뒤 `T`로 추적하는 것입니다. 초기 템플릿을 고정 앵커로 유지하고, confidence가 높은 프레임에서만 adaptive template을 갱신합니다. 검색 중심은 이전 속도 기반 예측점이며, template matching 점수는 normalized correlation, 색상 유사도, 대비 안정성, 거리 penalty를 조합합니다. 투포환/공처럼 배경과 색상 차이가 있는 물체는 연결된 ROI 안의 foreground/background 색상 모델로 blob 중심도 같이 추정한 뒤 template 후보와 결합합니다. 결과 좌표는 confidence-weighted smoothing 후 속도를 계산합니다.
+## Known Limitations
+
+- Videos are played directly by the browser. There is no backend FFmpeg proxy yet.
+- Variable-frame-rate videos may not produce perfectly stable frame stepping.
+- Browser template tracking is useful for education/prototyping but not yet a validated biomechanical measurement engine.
+- Tracking can still fail when the object has low contrast, occlusion, motion blur, or a background with similar colors.
+- There is no project import yet, only export.
+- No automated tests are present yet.
+- The UI is still a prototype and should be hardened before classroom use.
+
+## Next Work For A Follow-Up AI
+
+Highest-priority engineering tasks:
+
+- Add project JSON import so exported work can be reopened.
+- Add track editing: delete samples, correct a bad frame, interpolate corrected sections.
+- Add a visible tracking status/progress overlay instead of `alert()`.
+- Improve ROI controls: resize handles, locked aspect ratio, and clearer selected state.
+- Add per-track settings: search radius, ROI size, confidence threshold, smoothing on/off.
+- Add validation samples and simple regression tests for angle, calibration, and timeline mapping.
+- Add backend preprocessing option to convert uploads to constant-frame-rate proxy MP4.
+- Add AI pose import using the same `analysisTime` track structure.
+
+Useful implementation locations:
+
+- `app.js`: all current state, rendering, annotation interaction, tracking, export.
+- `index.html`: static UI shell and context menu.
+- `styles.css`: layout, video player stage, tools, transport controls.
+
+## Repository
+
+GitHub: https://github.com/biomech-gil/kinetutor
