@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>KineTutor</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <header class="app-header">
+      <div>
+        <p class="eyebrow">KineTutor · KT</p>
+        <h1>비디오로 배우는 운동학 측정</h1>
+      </div>
+      <label class="upload">
+        영상 업로드
+        <input id="fileInput" type="file" accept="video/*" multiple>
+      </label>
+    </header>
+
+    <main class="app-shell">
+      <aside class="panel">
+        <section>
+          <h2>측정 도구</h2>
+          <div class="tool-grid">
+            <button data-tool="select">선택</button>
+            <button data-tool="marker">마커</button>
+            <button data-tool="line">거리</button>
+            <button data-tool="angle">3마커 각도</button>
+          </div>
+          <p class="hint">각도는 첫 점-관절점-끝 점 순서로 찍습니다. 모든 좌표는 공통 분석 시간 기준으로 저장됩니다.</p>
+        </section>
+
+        <section>
+          <h2>프로젝트 JSON</h2>
+          <textarea id="projectJson" readonly spellcheck="false"></textarea>
+          <div class="export-row">
+            <button id="exportProject">JSON 저장</button>
+            <button id="exportCsv">CSV 저장</button>
+          </div>
+        </section>
+      </aside>
+
+      <section class="workspace">
+        <div id="emptyState" class="empty-state">
+          <strong>영상을 여러 개 업로드하세요.</strong>
+          <span>각 플레이어의 In/Out/Offset을 조정하면 하나의 분석 타임라인에서 싱크 재생됩니다.</span>
+        </div>
+        <div id="playerGrid" class="player-grid"></div>
+      </section>
+    </main>
+
+    <footer class="transport">
+      <button id="stepBack">-1 frame</button>
+      <button id="playPause" class="primary">재생</button>
+      <button id="stepForward">+1 frame</button>
+      <input id="timeline" type="range" min="0" max="0" step="0.001" value="0">
+      <output id="timeReadout">00:00.000 / 00:00.000</output>
+    </footer>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
