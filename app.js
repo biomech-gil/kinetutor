@@ -99,6 +99,15 @@ function pauseAllVideos() {
   });
 }
 
+function seekVideoElement(player) {
+  if (!player.video) return;
+  const target = sourceTimeFor(player);
+  if (Math.abs(player.video.currentTime - target) > 0.015) {
+    player.video.currentTime = target;
+  }
+  player.video.pause();
+}
+
 function playerById(playerId) {
   return state.players.find((player) => player.id === playerId);
 }
@@ -1619,7 +1628,7 @@ async function addFiles(files) {
 
 function seekAll(analysisTime) {
   state.analysisTime = clamp(analysisTime, 0, analysisDuration());
-  state.players.forEach((player) => syncVideoElement(player, false));
+  state.players.forEach(seekVideoElement);
   updateTimeline();
   drawAllOverlays();
 }
