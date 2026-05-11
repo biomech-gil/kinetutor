@@ -23,7 +23,6 @@ const els = {
   projectJson: document.querySelector("#projectJson"),
   exportCsv: document.querySelector("#exportCsv"),
   exportProject: document.querySelector("#exportProject"),
-  toolButtons: document.querySelectorAll("[data-tool]"),
 };
 
 const DEFAULT_FPS = 30;
@@ -105,10 +104,14 @@ function updateActivePlayerUI() {
 function setTool(tool) {
   state.selectedTool = tool;
   state.currentDraft = null;
-  els.toolButtons.forEach((button) => {
-    button.classList.toggle("active", button.dataset.tool === tool);
-  });
+  updateToolUI();
   drawAllOverlays();
+}
+
+function updateToolUI() {
+  document.querySelectorAll("[data-tool]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.tool === state.selectedTool);
+  });
 }
 
 function videoContentRect(player, useCanvasPixels = false) {
@@ -235,6 +238,12 @@ function playerCard(player) {
       <div class="video-wrap">
         <video playsinline muted preload="metadata" src="${player.objectUrl}"></video>
         <canvas class="overlay"></canvas>
+        <div class="player-tools" aria-label="측정 도구">
+          <button type="button" data-tool="select" title="선택">S</button>
+          <button type="button" data-tool="marker" title="마커">+</button>
+          <button type="button" data-tool="line" title="거리">/</button>
+          <button type="button" data-tool="angle" title="3마커 각도">A</button>
+        </div>
       </div>
       <div class="trim-grid">
         <label>In <input data-field="sourceIn" type="number" min="0" step="0.001" value="${player.sourceIn.toFixed(3)}"></label>
@@ -289,6 +298,7 @@ function renderPlayers() {
 
   updateTimeline();
   updateActivePlayerUI();
+  updateToolUI();
   drawAllOverlays();
 }
 
@@ -553,7 +563,14 @@ els.timeline.addEventListener("input", () => {
   setPlaying(false);
   seekAll(Number(els.timeline.value));
 });
-els.toolButtons.forEach((button) => button.addEventListener("click", () => setTool(button.dataset.tool)));
+document.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-tool]");
+  if (!button) return;
+  event.preventDefault();
+  const card = button.closest(".player-card");
+  if (card) setActivePlayer(card.dataset.playerId);
+  setTool(button.dataset.tool);
+});
 els.exportCsv.addEventListener("click", () => downloadText("analysis_annotations.csv", csvRows(), "text/csv"));
 els.exportProject.addEventListener("click", () => downloadText("kinematic_project.json", JSON.stringify(projectSnapshot(), null, 2), "application/json"));
 window.addEventListener("resize", drawAllOverlays);
